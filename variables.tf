@@ -195,6 +195,12 @@ variable "nat_instance_user_data_post_install" {
   default     = ""
 }
 
+variable "permissions_boundary" {
+  description = "ARN of a policy to attach as the permissions boundary on every IAM role created by this module. Required when the caller's own permissions are delegated via a boundary that conditions IAM writes on iam:PermissionsBoundary."
+  type        = string
+  default     = null
+}
+
 variable "prevent_destroy_eips" {
   description = "Prevents accidental destruction of EIPs by setting `prevent_destroy=true`"
   type        = bool

@@ -48,10 +48,11 @@ resource "aws_lambda_function" "alternat_autoscaling_hook" {
 }
 
 resource "aws_iam_role" "nat_lambda_role" {
-  name               = var.nat_lambda_function_role_name == "" ? null : var.nat_lambda_function_role_name
-  name_prefix        = var.nat_lambda_function_role_name == "" ? "alternat-lambda-role-" : null
-  assume_role_policy = data.aws_iam_policy_document.nat_lambda_policy.json
-  tags               = var.tags
+  name                 = var.nat_lambda_function_role_name == "" ? null : var.nat_lambda_function_role_name
+  name_prefix          = var.nat_lambda_function_role_name == "" ? "alternat-lambda-role-" : null
+  assume_role_policy   = data.aws_iam_policy_document.nat_lambda_policy.json
+  permissions_boundary = var.permissions_boundary
+  tags                 = var.tags
 }
 
 resource "aws_iam_role_policy_attachment" "nat_lambda_basic_execution_role_attachment" {

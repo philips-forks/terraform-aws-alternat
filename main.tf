@@ -144,8 +144,9 @@ resource "aws_iam_role" "alternat_lifecycle_hook" {
   name        = var.nat_instance_lifecycle_hook_role_name == "" ? null : var.nat_instance_lifecycle_hook_role_name
   name_prefix = var.nat_instance_lifecycle_hook_role_name == "" ? "alternat-lifecycle-hook-" : null
 
-  assume_role_policy = data.aws_iam_policy_document.lifecycle_hook_assume_role.json
-  tags               = var.tags
+  assume_role_policy   = data.aws_iam_policy_document.lifecycle_hook_assume_role.json
+  permissions_boundary = var.permissions_boundary
+  tags                 = var.tags
 }
 
 data "aws_iam_policy_document" "lifecycle_hook_assume_role" {
@@ -388,8 +389,9 @@ resource "aws_iam_role" "alternat_instance" {
   name        = var.nat_instance_iam_role_name == "" ? null : var.nat_instance_iam_role_name
   name_prefix = var.nat_instance_iam_role_name == "" ? "alternat-instance-" : null
 
-  assume_role_policy = data.aws_iam_policy_document.nat_instance_assume_role.json
-  tags               = var.tags
+  assume_role_policy   = data.aws_iam_policy_document.nat_instance_assume_role.json
+  permissions_boundary = var.permissions_boundary
+  tags                 = var.tags
 }
 
 data "aws_iam_policy_document" "nat_instance_assume_role" {
