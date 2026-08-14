@@ -190,7 +190,7 @@ resource "aws_lambda_function" "alternat_connectivity_tester" {
 }
 
 resource "aws_security_group" "nat_lambda" {
-  name_prefix = "alternat-lambda"
+  name_prefix = var.nat_lambda_sg_name_prefix
   vpc_id      = var.vpc_id
   tags        = var.tags
 }
