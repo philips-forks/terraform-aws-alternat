@@ -151,6 +151,42 @@ variable "nat_instance_sg_name_prefix" {
   default     = "alternat-instance"
 }
 
+variable "nat_gateway_name_prefix" {
+  description = "Prefix for the standby NAT Gateway Name tag. Suffixed with the AZ name."
+  type        = string
+  default     = "alternat-"
+}
+
+variable "nat_gateway_eip_name" {
+  description = "Name tag for the standby NAT Gateway Elastic IPs."
+  type        = string
+  default     = "alternat-gateway-eip"
+}
+
+variable "nat_instance_eip_name_prefix" {
+  description = "Prefix for the NAT instance Elastic IP Name tag. Suffixed with an index."
+  type        = string
+  default     = "alternat-instance-"
+}
+
+variable "sns_topic_name_prefix" {
+  description = "Prefix for the AlterNAT SNS topic name."
+  type        = string
+  default     = "alternat-topic"
+}
+
+variable "nat_lambda_sg_name_prefix" {
+  description = "Prefix for the AlterNAT connectivity tester Lambda security group name."
+  type        = string
+  default     = "alternat-lambda"
+}
+
+variable "vpc_endpoint_sg_name_prefix" {
+  description = "Prefix for the AlterNAT VPC endpoint security group name."
+  type        = string
+  default     = "ec2-vpc-endpoints-"
+}
+
 variable "nat_lambda_function_role_name" {
   description = "Name to use for the IAM role used by the replace-route Lambda function. Must be globally unique in this AWS account."
   type        = string

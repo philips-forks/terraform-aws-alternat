@@ -61,7 +61,7 @@ resource "aws_eip" "protected_nat_instance_eips" {
   : var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0)
 
   tags = merge(var.tags, {
-    "Name" = "alternat-instance-${count.index}"
+    "Name" = "${var.nat_instance_eip_name_prefix}${count.index}"
   })
 
   lifecycle {
@@ -75,12 +75,12 @@ resource "aws_eip" "nat_instance_eips" {
   : (var.prevent_destroy_eips ? 0 : length(var.vpc_az_maps)))
 
   tags = merge(var.tags, {
-    "Name" = "alternat-instance-${count.index}"
+    "Name" = "${var.nat_instance_eip_name_prefix}${count.index}"
   })
 }
 
 resource "aws_sns_topic" "alternat_topic" {
-  name_prefix       = "alternat-topic"
+  name_prefix       = var.sns_topic_name_prefix
   kms_master_key_id = "alias/aws/sns"
   tags              = var.tags
 }
@@ -505,7 +505,7 @@ resource "aws_eip" "protected_nat_gateway_eips" {
     if var.create_nat_gateways && var.prevent_destroy_eips && !contains(keys(var.fallback_ngw_eip_allocation_ids), obj.az)
   }
   tags = merge(var.tags, {
-    "Name" = "alternat-gateway-eip"
+    "Name" = var.nat_gateway_eip_name
   })
   lifecycle {
     prevent_destroy = true
@@ -519,7 +519,7 @@ resource "aws_eip" "nat_gateway_eips" {
     if var.create_nat_gateways && !var.prevent_destroy_eips && !contains(keys(var.fallback_ngw_eip_allocation_ids), obj.az)
   }
   tags = merge(var.tags, {
-    "Name" = "alternat-gateway-eip"
+    "Name" = var.nat_gateway_eip_name
   })
 }
 
@@ -532,7 +532,7 @@ resource "aws_nat_gateway" "main" {
   allocation_id = local.ngw_alloc_ids[each.key]
   subnet_id     = each.value
   tags = merge(var.tags, {
-    Name = "alternat-${each.key}"
+    Name = "${var.nat_gateway_name_prefix}${each.key}"
   })
 }
 
@@ -550,7 +550,7 @@ locals {
 resource "aws_security_group" "vpc_endpoint" {
   count = length(local.ec2_endpoint) > 0 ? 1 : 0
 
-  name_prefix = "ec2-vpc-endpoints-"
+  name_prefix = var.vpc_endpoint_sg_name_prefix
   description = "Allow TLS from the VPC CIDR to the AWS API."
   vpc_id      = var.vpc_id
 
