@@ -218,7 +218,8 @@ data "cloudinit_config" "config" {
       content_type = "text/x-shellscript"
       content = templatefile("${path.module}/cwagent.json.tftpl", {
         cloudwatch_namespace  = var.cloudwatch_namespace,
-        cloudwatch_interfaces = jsonencode(var.cloudwatch_interfaces)
+        cloudwatch_interfaces = jsonencode(var.cloudwatch_interfaces),
+        az                    = each.key,
       })
     }
   }

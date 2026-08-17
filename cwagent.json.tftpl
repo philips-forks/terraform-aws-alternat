@@ -23,6 +23,35 @@ cat <<EOF > $CWAGENT_CONFIG_FILE
   "metrics": {
     "namespace": "${cloudwatch_namespace}",
     "metrics_collected": {
+      "cpu": {
+        "resources": ["*"],
+        "totalcpu": true,
+        "measurement": [
+          { "name": "usage_active", "rename": "CpuUsageActive", "unit": "Percent" },
+          { "name": "usage_iowait", "rename": "CpuUsageIoWait", "unit": "Percent" }
+        ],
+        "append_dimensions": {
+          "AvailabilityZone": "${az}"
+        }
+      },
+      "disk": {
+        "resources": ["/"],
+        "ignore_file_system_types": ["sysfs", "devtmpfs", "tmpfs"],
+        "measurement": [
+          { "name": "used_percent", "rename": "DiskUsedPercent", "unit": "Percent" }
+        ],
+        "append_dimensions": {
+          "AvailabilityZone": "${az}"
+        }
+      },
+      "swap": {
+        "measurement": [
+          { "name": "used_percent", "rename": "SwapUsedPercent", "unit": "Percent" }
+        ],
+        "append_dimensions": {
+          "AvailabilityZone": "${az}"
+        }
+      },
       "net": {
         "resources": ${cloudwatch_interfaces},
         "measurement": [
@@ -32,14 +61,22 @@ cat <<EOF > $CWAGENT_CONFIG_FILE
           { "name": "packets_recv", "rename": "PacketsInCount",  "unit": "Count" },
           { "name": "drop_in", "rename": "PacketsDropInCount",  "unit": "Count" },
           { "name": "drop_out", "rename": "PacketsDropOutCount",  "unit": "Count" }
-        ]
+        ],
+        "append_dimensions": {
+          "AvailabilityZone": "${az}"
+        }
       },
       "netstat": {
         "measurement": [
           { "name": "tcp_syn_sent", "rename": "ConnectionAttemptOutCount",  "unit": "Count" },
           { "name": "tcp_syn_recv", "rename": "ConnectionAttemptInCount",  "unit": "Count" },
-          { "name": "tcp_established", "rename": "ConnectionEstablishedCount",  "unit": "Count" }
-        ]
+          { "name": "tcp_established", "rename": "ConnectionEstablishedCount",  "unit": "Count" },
+          { "name": "tcp_close_wait", "rename": "ConnectionCloseWaitCount",  "unit": "Count" },
+          { "name": "tcp_time_wait", "rename": "ConnectionTimeWaitCount",  "unit": "Count" }
+        ],
+        "append_dimensions": {
+          "AvailabilityZone": "${az}"
+        }
       },
       "ethtool": {
         "interface_include": ${cloudwatch_interfaces},
@@ -53,7 +90,10 @@ cat <<EOF > $CWAGENT_CONFIG_FILE
       "mem": {
         "measurement": [
           { "name": "used_percent", "rename": "MemoryUsed",  "unit": "Percent" }
-        ]
+        ],
+        "append_dimensions": {
+          "AvailabilityZone": "${az}"
+        }
       }
     },
     "append_dimensions": {
@@ -65,3 +105,49 @@ cat <<EOF > $CWAGENT_CONFIG_FILE
 EOF
 
 systemctl restart amazon-cloudwatch-agent
+
+# CWAgent has no uptime plugin, so a small systemd timer emits InstanceUptimeSeconds.
+cat <<'PUBLISH_UPTIME_SCRIPT' > /usr/local/bin/alternat-publish-uptime.sh
+#!/usr/bin/env bash
+set -euo pipefail
+TOKEN=$(curl -sSf --retry 3 --retry-delay 1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+IID=$(curl -sSf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+REGION=$(curl -sSf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+AZ=$(curl -sSf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+UPTIME=$(awk '{print int($1)}' /proc/uptime)
+aws cloudwatch put-metric-data \
+  --region "$REGION" \
+  --namespace "${cloudwatch_namespace}" \
+  --metric-name InstanceUptimeSeconds \
+  --unit Seconds \
+  --value "$UPTIME" \
+  --dimensions "InstanceId=$IID,AvailabilityZone=$AZ"
+PUBLISH_UPTIME_SCRIPT
+chmod 0755 /usr/local/bin/alternat-publish-uptime.sh
+
+cat <<'PUBLISH_UPTIME_SERVICE' > /etc/systemd/system/alternat-publish-uptime.service
+[Unit]
+Description=Publish alterNAT instance uptime to CloudWatch
+After=network-online.target amazon-cloudwatch-agent.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/alternat-publish-uptime.sh
+PUBLISH_UPTIME_SERVICE
+
+cat <<'PUBLISH_UPTIME_TIMER' > /etc/systemd/system/alternat-publish-uptime.timer
+[Unit]
+Description=Publish alterNAT instance uptime every 5 minutes
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=5min
+Unit=alternat-publish-uptime.service
+
+[Install]
+WantedBy=timers.target
+PUBLISH_UPTIME_TIMER
+
+systemctl daemon-reload
+systemctl enable --now alternat-publish-uptime.timer
