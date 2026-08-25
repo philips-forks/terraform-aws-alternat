@@ -1,0 +1,18 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "dependencyDashboard": true,
+  "enabledManagers": ["dockerfile", "pip_requirements"],
+  "packageRules": [
+    {
+      "matchManagers": ["dockerfile", "pip_requirements"],
+      "groupName": "alternat dependencies",
+      "matchUpdateTypes": ["minor", "patch"]
+    },
+    {
+      "matchManagers": ["dockerfile", "pip_requirements"],
+      "matchUpdateTypes": ["major"],
+      "groupName": "alternat dependencies (major)"
+    }
+  ]
+}
