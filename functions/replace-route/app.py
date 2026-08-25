@@ -3,6 +3,8 @@ import json
 import logging
 import time
 import urllib
+import urllib.error
+import urllib.request
 import socket
 import concurrent.futures
 
@@ -254,7 +256,7 @@ def publish_restore_failed():
 def attempt_nat_instance_restore():
     ssm_client = boto3.client('ssm')
     nat_instance_id = get_current_nat_instance_id(os.getenv("NAT_ASG_NAME"))
-    route_tables = os.getenv("ROUTE_TABLE_IDS_CSV", "").split(",")
+    route_tables = [r for r in os.getenv("ROUTE_TABLE_IDS_CSV", "").split(",") if r]
 
     if not nat_instance_id or not route_tables:
         logger.warning("NAT_INSTANCE_ID or ROUTE_TABLE_IDS_CSV not set. Skipping NAT restore.")
@@ -338,13 +340,20 @@ def _check_single_url(url):
 
 
 def check_connectivity(check_urls):
-    """Return True if any URL is reachable. All URLs are checked in parallel."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(check_urls)) as executor:
-        futures = {executor.submit(_check_single_url, url): url for url in check_urls}
-        for future in concurrent.futures.as_completed(futures):
-            if future.result():
-                return True
-    return False
+    """Return True if any URL is reachable. Checks run in parallel; returns as
+    soon as one succeeds. Remaining threads finish their timeout in the background
+    (at most REQUEST_TIMEOUT seconds) without blocking the caller."""
+    if not check_urls:
+        return False
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(check_urls))
+    futures = {executor.submit(_check_single_url, url): url for url in check_urls}
+    result = False
+    for future in concurrent.futures.as_completed(futures):
+        if future.result():
+            result = True
+            break
+    executor.shutdown(wait=False)  # let remaining in-flight threads expire without blocking
+    return result
 
 
 def check_connection(check_urls):
@@ -356,7 +365,7 @@ def check_connection(check_urls):
     the restore attempt runs AFTER confirming connectivity, so that an SSM hang
     cannot delay failover detection.
     """
-    route_tables = os.getenv("ROUTE_TABLE_IDS_CSV", "").split(",")
+    route_tables = [r for r in os.getenv("ROUTE_TABLE_IDS_CSV", "").split(",") if r]
     if not route_tables:
         raise MissingEnvironmentVariableError("ROUTE_TABLE_IDS_CSV")
 
@@ -462,7 +471,7 @@ def connectivity_test_handler(event, context):
             break
 
     # Publish route state once per invocation, after all route decisions are done.
-    route_tables = os.getenv("ROUTE_TABLE_IDS_CSV", "").split(",")
+    route_tables = [r for r in os.getenv("ROUTE_TABLE_IDS_CSV", "").split(",") if r]
     publish_nat_gateway_active(are_any_routes_pointing_to_nat_gateway(route_tables))
 
 def get_env_bool(var_name, default_value=False):
