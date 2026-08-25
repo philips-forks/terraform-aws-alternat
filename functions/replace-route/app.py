@@ -16,6 +16,7 @@ logging.getLogger('botocore').setLevel(logging.CRITICAL)
 
 
 ec2_client = boto3.client("ec2")
+cloudwatch_client = boto3.client("cloudwatch")
 
 LIFECYCLE_HOOK_NAME_KEY = "LifecycleHookName"
 AUTO_SCALING_GROUP_NAME_KEY = "AutoScalingGroupName"
@@ -38,6 +39,9 @@ DEFAULT_ENABLE_NAT_RESTORE = False
 
 # Whether or not use IPv6.
 DEFAULT_HAS_IPV6 = True
+
+METRIC_NAMESPACE = "AlterNAT"
+METRIC_ROUTE_STATE = "NATGatewayActive"
 
 
 # Overrides socket.getaddrinfo to perform IPv4 lookups
@@ -348,6 +352,39 @@ def get_current_nat_instance_id(asg_name):
         logger.error(f"Failed to retrieve NAT instance ID from ASG {asg_name}: {e}")
         return None
 
+
+def publish_nat_gateway_active(on_gateway):
+    """Publish NATGatewayActive reflecting the actual route state at end of invocation.
+
+    Called once per tester invocation, after all route decisions are complete,
+    so the value always reflects settled state rather than a mid-run snapshot.
+    Silently skips if AVAILABILITY_ZONE or ENVIRONMENT env vars are absent.
+    """
+    az = os.getenv("AVAILABILITY_ZONE", "")
+    environment = os.getenv("ENVIRONMENT", "")
+    if not az or not environment:
+        logger.debug("AVAILABILITY_ZONE or ENVIRONMENT not set; skipping NATGatewayActive publish")
+        return
+
+    value = 1.0 if on_gateway else 0.0
+    try:
+        cloudwatch_client.put_metric_data(
+            Namespace=METRIC_NAMESPACE,
+            MetricData=[{
+                "MetricName": METRIC_ROUTE_STATE,
+                "Dimensions": [
+                    {"Name": "Environment", "Value": environment},
+                    {"Name": "AvailabilityZone", "Value": az},
+                ],
+                "Value": value,
+                "Unit": "Count",
+            }]
+        )
+        logger.debug("Published %s=%.1f (AZ=%s, Environment=%s)", METRIC_ROUTE_STATE, value, az, environment)
+    except Exception as e:
+        logger.warning("Failed to publish %s metric: %s", METRIC_ROUTE_STATE, e)
+
+
 def connectivity_test_handler(event, context):
     if not isinstance(event, dict):
         logger.error(f"Unknown event: {event}")
@@ -375,6 +412,10 @@ def connectivity_test_handler(event, context):
             run += 1
         else:
             break
+
+    # Publish route state once per invocation, after all route decisions are done.
+    route_tables = os.getenv("ROUTE_TABLE_IDS_CSV", "").split(",")
+    publish_nat_gateway_active(are_any_routes_pointing_to_nat_gateway(route_tables))
 
 def get_env_bool(var_name, default_value=False):
     value = os.getenv(var_name, default_value)
