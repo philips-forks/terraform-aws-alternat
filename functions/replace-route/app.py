@@ -4,6 +4,7 @@ import logging
 import time
 import urllib
 import socket
+import concurrent.futures
 
 import botocore
 import boto3
@@ -28,8 +29,9 @@ DEFAULT_CONNECTIVITY_CHECK_INTERVAL = "5"
 # Which URLs to check for connectivity
 DEFAULT_CHECK_URLS = ["https://www.example.com", "https://www.google.com"]
 
-# The timeout for the connectivity checks.
-REQUEST_TIMEOUT = 5
+# Per-URL request timeout. URLs are checked in parallel so the aggregate
+# time for all checks is ~REQUEST_TIMEOUT, not REQUEST_TIMEOUT * len(urls).
+REQUEST_TIMEOUT = 2
 
 # Waiting time for SSM to start commands.
 SSM_TIMEOUT_SECONDS = 30
@@ -226,6 +228,29 @@ def are_any_routes_pointing_to_nat_gateway(route_table_ids):
         logger.error(f"Error checking NAT Gateway routes: {e}")
         return False
 
+def publish_restore_failed():
+    """Publish RestoreFailed=1 so the restore_failed alarm fires on repeated failures."""
+    az = os.getenv("AVAILABILITY_ZONE", "")
+    environment = os.getenv("ENVIRONMENT", "")
+    if not az or not environment:
+        return
+    try:
+        cloudwatch_client.put_metric_data(
+            Namespace=METRIC_NAMESPACE,
+            MetricData=[{
+                "MetricName": "RestoreFailed",
+                "Dimensions": [
+                    {"Name": "Environment", "Value": environment},
+                    {"Name": "AvailabilityZone", "Value": az},
+                ],
+                "Value": 1.0,
+                "Unit": "Count",
+            }]
+        )
+        logger.debug("Published RestoreFailed metric")
+    except Exception as e:
+        logger.warning("Failed to publish RestoreFailed metric: %s", e)
+
 def attempt_nat_instance_restore():
     ssm_client = boto3.client('ssm')
     nat_instance_id = get_current_nat_instance_id(os.getenv("NAT_ASG_NAME"))
@@ -233,6 +258,7 @@ def attempt_nat_instance_restore():
 
     if not nat_instance_id or not route_tables:
         logger.warning("NAT_INSTANCE_ID or ROUTE_TABLE_IDS_CSV not set. Skipping NAT restore.")
+        publish_restore_failed()
         return
 
     logger.info("Attempting to restore route to NAT Instance: %s", nat_instance_id)
@@ -269,9 +295,11 @@ def attempt_nat_instance_restore():
                 try:
                     if not run_nat_instance_diagnostics(nat_instance_id):
                         logger.warning("Skipping route restore due to failed NAT diagnostics.")
+                        publish_restore_failed()
                         return
                 except Exception as diag_error:
                     logger.error("Unexpected error during NAT diagnostics: %s", str(diag_error))
+                    publish_restore_failed()
                     return
                 for rtb in route_tables:
                     replace_route(rtb, nat_instance_id)
@@ -279,52 +307,73 @@ def attempt_nat_instance_restore():
                 return
             else:
                 logger.warning("Invocation output: %s", invocation['StandardOutputContent'])
+                publish_restore_failed()
         else:
             logger.warning("NAT instance connectivity test failed or did not return expected result.")
-
+            publish_restore_failed()
 
     except botocore.exceptions.ClientError as e:
         logger.error("SSM command failed: %s", str(e))
+        publish_restore_failed()
     except Exception as ex:
         logger.error("Unexpected error during NAT restore: %s", str(ex))
+        publish_restore_failed()
+
+
+def _check_single_url(url):
+    """Return True if the URL is reachable at the network layer."""
+    try:
+        req = urllib.request.Request(url)
+        req.add_header('User-Agent', 'alternat/1.0')
+        urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
+        logger.debug("Successfully connected to %s", url)
+        return True
+    except urllib.error.HTTPError as error:
+        # Any HTTP response means the network path is up
+        logger.warning("Response error from %s: %s, treating as success", url, error)
+        return True
+    except (urllib.error.URLError, socket.timeout) as error:
+        logger.error("error connecting to %s: %s", url, error)
+        return False
+
+
+def check_connectivity(check_urls):
+    """Return True if any URL is reachable. All URLs are checked in parallel."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(check_urls)) as executor:
+        futures = {executor.submit(_check_single_url, url): url for url in check_urls}
+        for future in concurrent.futures.as_completed(futures):
+            if future.result():
+                return True
+    return False
+
 
 def check_connection(check_urls):
     """
-    Checks connectivity to check_urls. If any of them succeed, return success.
-    If all fail, replaces the route table to point at a standby NAT Gateway and
-    return failure.
+    Checks connectivity to check_urls in parallel. If any URL succeeds, returns True.
+    If all fail, switches the route to the standby NAT Gateway and returns False.
 
-    If ENABLE_NAT_RESTORE is set and we're currently using the NAT Gateway,
-    attempt to restore route to the NAT instance before checking connectivity.
+    If ENABLE_NAT_RESTORE is set and the route is currently on the NAT Gateway,
+    the restore attempt runs AFTER confirming connectivity, so that an SSM hang
+    cannot delay failover detection.
     """
     route_tables = os.getenv("ROUTE_TABLE_IDS_CSV", "").split(",")
     if not route_tables:
         raise MissingEnvironmentVariableError("ROUTE_TABLE_IDS_CSV")
 
     restore_enabled = get_env_bool("ENABLE_NAT_RESTORE", DEFAULT_ENABLE_NAT_RESTORE)
+    on_gateway = are_any_routes_pointing_to_nat_gateway(route_tables)
 
-    # Step 1: Try failback to NAT instance if allowed and current route is NAT Gateway
-    if restore_enabled and are_any_routes_pointing_to_nat_gateway(route_tables):
-        logger.info("ENABLE_NAT_RESTORE=true and route is NAT Gateway. Trying to restore NAT instance...")
-        attempt_nat_instance_restore()
-        time.sleep(5)
+    # Step 1: Test connectivity in parallel — always runs first, unblocked by SSM
+    if check_connectivity(check_urls):
+        # Connectivity confirmed. If on gateway and restore is enabled, try to
+        # move back to the NAT instance. This runs after the connectivity check
+        # so an SSM hang here cannot prevent failover detection.
+        if restore_enabled and on_gateway:
+            logger.info("ENABLE_NAT_RESTORE=true and route is NAT Gateway. Trying to restore NAT instance...")
+            attempt_nat_instance_restore()
+        return True
 
-    # Step 2: Test connectivity
-    for url in check_urls:
-        try:
-            req = urllib.request.Request(url)
-            req.add_header('User-Agent', 'alternat/1.0')
-            urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
-            logger.debug("Successfully connected to %s", url)
-            return True
-        except urllib.error.HTTPError as error:
-            logger.warning("Response error from %s: %s, treating as success", url, error)
-            return True
-        except urllib.error.URLError as error:
-            logger.error("error connecting to %s: %s", url, error)
-        except socket.timeout as error:
-            logger.error("timeout error connecting to %s: %s", url, error)
-
+    # Step 2: All URLs failed — switch route to standby NAT Gateway
     logger.warning("Failed connectivity tests! Replacing route")
 
     public_subnet_id = os.getenv("PUBLIC_SUBNET_ID")
@@ -332,7 +381,6 @@ def check_connection(check_urls):
         raise MissingEnvironmentVariableError("PUBLIC_SUBNET_ID")
 
     vpc_id = get_vpc_id(route_tables[0])
-
     nat_gateway_id = get_nat_gateway_id(vpc_id, public_subnet_id)
 
     for rtb in route_tables:
