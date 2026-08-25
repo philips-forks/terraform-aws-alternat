@@ -482,6 +482,22 @@ data "aws_iam_policy_document" "alternat_ec2_policy" {
       "arn:aws:autoscaling:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.nat_instance_name_prefix}*",
     ]
   }
+
+  # SetInstanceHealth takes only InstanceId so IAM cannot resolve an ASG ARN;
+  # use resources=* with a tag condition to scope to NAT instances.
+  statement {
+    sid    = "alterNATSelfHealPermissions"
+    effect = "Allow"
+    actions = [
+      "autoscaling:SetInstanceHealth",
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/alterNATInstance"
+      values   = ["true"]
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "alternat_ec2" {
