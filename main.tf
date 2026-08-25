@@ -483,7 +483,8 @@ data "aws_iam_policy_document" "alternat_ec2_policy" {
     ]
   }
 
-  # SetInstanceHealth does not support resource-level permissions; must use *.
+  # SetInstanceHealth takes only InstanceId so IAM cannot resolve an ASG ARN;
+  # use resources=* with a tag condition to scope to NAT instances.
   statement {
     sid    = "alterNATSelfHealPermissions"
     effect = "Allow"
@@ -491,6 +492,11 @@ data "aws_iam_policy_document" "alternat_ec2_policy" {
       "autoscaling:SetInstanceHealth",
     ]
     resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/alterNATInstance"
+      values   = ["true"]
+    }
   }
 }
 
