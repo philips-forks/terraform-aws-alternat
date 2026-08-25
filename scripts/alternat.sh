@@ -191,6 +191,75 @@ install_cloudwatch_agent() {
    fi
 }
 
+# install_nat_health_check() installs a systemd timer that checks NAT config every 60 seconds.
+# If ip_forward or the nftables masquerade rule is missing the instance marks itself Unhealthy
+# in the ASG, triggering automatic replacement without waiting for external connectivity to fail.
+install_nat_health_check() {
+   echo "Installing NAT health check timer"
+
+   # Bake instance identity into an env file read by the systemd service.
+   cat > /etc/alternat-health-check.env <<EOF
+INSTANCE_ID=${INSTANCE_ID}
+AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+AWS_DEFAULT_OUTPUT=text
+AWS_PAGER=
+EOF
+
+   cat > /usr/local/bin/nat-health-check.sh <<'SCRIPT'
+#!/bin/bash
+FAIL=0
+FAIL_REASON=""
+
+if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]; then
+    FAIL=1
+    FAIL_REASON="ip_forward is not 1"
+fi
+
+if ! nft list table ip nat 2>/dev/null | grep -q masquerade; then
+    FAIL=1
+    FAIL_REASON="${FAIL_REASON:+$FAIL_REASON, }nftables masquerade rule missing"
+fi
+
+if [ "$FAIL" = "1" ]; then
+    echo "NAT health check FAILED: ${FAIL_REASON}. Marking instance ${INSTANCE_ID} unhealthy."
+    aws autoscaling set-instance-health \
+        --instance-id "${INSTANCE_ID}" \
+        --health-status Unhealthy
+fi
+SCRIPT
+   chmod +x /usr/local/bin/nat-health-check.sh
+
+   cat > /etc/systemd/system/nat-health-check.service <<'EOF'
+[Unit]
+Description=AlterNAT instance NAT configuration health check
+After=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/alternat-health-check.env
+ExecStart=/usr/local/bin/nat-health-check.sh
+StandardOutput=journal
+StandardError=journal
+EOF
+
+   cat > /etc/systemd/system/nat-health-check.timer <<'EOF'
+[Unit]
+Description=AlterNAT NAT health check timer
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=60
+AccuracySec=1
+
+[Install]
+WantedBy=timers.target
+EOF
+
+   systemctl daemon-reload
+   systemctl enable --now nat-health-check.timer
+   echo "NAT health check timer installed and started"
+}
+
 ASG_LIFECYCLE_HOOK_NAME="NATInstanceLaunchScript"
 complete_asg_lifecycle_action() {
   if [[ -z "$1" ]]; then
@@ -256,5 +325,6 @@ configure_nat
 disable_source_dest_check
 associate_eip
 configure_route_table
+install_nat_health_check
 complete_asg_lifecycle_action CONTINUE
 echo "Configuration completed successfully!"

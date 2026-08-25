@@ -482,6 +482,17 @@ data "aws_iam_policy_document" "alternat_ec2_policy" {
       "arn:aws:autoscaling:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.nat_instance_name_prefix}*",
     ]
   }
+
+  statement {
+    sid    = "alterNATSelfHealPermissions"
+    effect = "Allow"
+    actions = [
+      "autoscaling:SetInstanceHealth",
+    ]
+    resources = [
+      "arn:aws:autoscaling:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.nat_instance_name_prefix}*",
+    ]
+  }
 }
 
 resource "aws_iam_role_policy" "alternat_ec2" {
@@ -497,94 +508,3 @@ resource "aws_iam_role_policy" "alternat_additional_policies" {
   policy = var.additional_instance_policies[count.index].policy_json
   role   = aws_iam_role.alternat_instance.name
 }
-
-## NAT Gateway used as a backup route
-resource "aws_eip" "protected_nat_gateway_eips" {
-  for_each = {
-    for obj in var.vpc_az_maps
-    : obj.az => obj.public_subnet_id
-    if var.create_nat_gateways && var.prevent_destroy_eips && !contains(keys(var.fallback_ngw_eip_allocation_ids), obj.az)
-  }
-  tags = merge(var.tags, {
-    "Name" = var.nat_gateway_eip_name
-  })
-  lifecycle {
-    prevent_destroy = true
-  }
-}
-
-resource "aws_eip" "nat_gateway_eips" {
-  for_each = {
-    for obj in var.vpc_az_maps
-    : obj.az => obj.public_subnet_id
-    if var.create_nat_gateways && !var.prevent_destroy_eips && !contains(keys(var.fallback_ngw_eip_allocation_ids), obj.az)
-  }
-  tags = merge(var.tags, {
-    "Name" = var.nat_gateway_eip_name
-  })
-}
-
-resource "aws_nat_gateway" "main" {
-  for_each = {
-    for obj in var.vpc_az_maps
-    : obj.az => obj.public_subnet_id
-    if var.create_nat_gateways
-  }
-  allocation_id = local.ngw_alloc_ids[each.key]
-  subnet_id     = each.value
-  tags = merge(var.tags, {
-    Name = "${var.nat_gateway_name_prefix}${each.key}"
-  })
-}
-
-data "aws_vpc" "vpc" {
-  id = var.vpc_id
-}
-
-locals {
-  all_vpc_cidr_ranges = [
-    for cidr_assoc in data.aws_vpc.vpc.cidr_block_associations
-    : cidr_assoc.cidr_block
-  ]
-}
-
-resource "aws_security_group" "vpc_endpoint" {
-  count = length(local.ec2_endpoint) > 0 ? 1 : 0
-
-  name_prefix = var.vpc_endpoint_sg_name_prefix
-  description = "Allow TLS from the VPC CIDR to the AWS API."
-  vpc_id      = var.vpc_id
-
-  ingress {
-    description = "TLS from within the VPC"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = local.all_vpc_cidr_ranges
-  }
-
-  egress {
-    from_port        = 0
-    to_port          = 0
-    protocol         = "-1"
-    cidr_blocks      = ["0.0.0.0/0"]
-    ipv6_cidr_blocks = ["::/0"]
-  }
-
-  tags = var.tags
-}
-
-module "vpc_endpoints" {
-  count = length(local.ec2_endpoint) > 0 ? 1 : 0
-
-  source             = "terraform-aws-modules/vpc/aws//modules/vpc-endpoints"
-  version            = "~> 3.14.0"
-  vpc_id             = var.vpc_id
-  security_group_ids = [aws_security_group.vpc_endpoint[0].id]
-  endpoints          = local.ec2_endpoint
-  tags               = var.tags
-}
-
-data "aws_default_tags" "current" {}
-data "aws_region" "current" {}
-data "aws_caller_identity" "current" {}
