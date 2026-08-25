@@ -1,0 +1,23 @@
+name: Renovate
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'  # every Monday at 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  renovate:
+    name: Run Renovate
+    runs-on: [self-hosted, linux, arm64, philips-code-hub, ubuntu-2404]
+    container:
+      image: ghcr.io/renovatebot/renovate:latest
+    steps:
+      - name: Run Renovate
+        run: renovate philips-forks/terraform-aws-alternat
+        env:
+          RENOVATE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOG_LEVEL: info
