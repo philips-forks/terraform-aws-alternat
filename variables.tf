@@ -43,6 +43,12 @@ variable "connectivity_test_check_urls" {
   default     = ["https://www.example.com", "https://www.google.com"]
 }
 
+variable "connectivity_min_success_percent" {
+  description = "Minimum percentage of connectivity check URLs that must be reachable for a NAT instance route restore to proceed. Prevents a single unreachable URL from blocking restore of a healthy instance."
+  type        = number
+  default     = 50
+}
+
 variable "connectivity_test_event_rule_name" {
   description = "The name to use for the event rule that invokes the connectivity test Lambda function."
   type        = string

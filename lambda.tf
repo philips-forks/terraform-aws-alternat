@@ -167,15 +167,16 @@ resource "aws_lambda_function" "alternat_connectivity_tester" {
   environment {
     variables = merge(
       {
-        ROUTE_TABLE_IDS_CSV = join(",", each.value.route_table_ids),
-        PUBLIC_SUBNET_ID    = each.value.public_subnet_id
-        CHECK_URLS          = join(",", var.connectivity_test_check_urls)
-        NAT_GATEWAY_ID      = var.nat_gateway_id
-        NAT_ASG_NAME        = aws_autoscaling_group.nat_instance[each.key].name
-        ENABLE_NAT_RESTORE  = var.enable_nat_restore
+        ROUTE_TABLE_IDS_CSV              = join(",", each.value.route_table_ids),
+        PUBLIC_SUBNET_ID                 = each.value.public_subnet_id
+        CHECK_URLS                       = join(",", var.connectivity_test_check_urls)
+        CONNECTIVITY_MIN_SUCCESS_PERCENT = tostring(var.connectivity_min_success_percent)
+        NAT_GATEWAY_ID                   = var.nat_gateway_id
+        NAT_ASG_NAME                     = aws_autoscaling_group.nat_instance[each.key].name
+        ENABLE_NAT_RESTORE               = var.enable_nat_restore
         # Required by publish_nat_gateway_active; ENVIRONMENT is expected from
         # lambda_environment_variables passed by the consumer module.
-        AVAILABILITY_ZONE   = each.key
+        AVAILABILITY_ZONE = each.key
       },
       local.has_ipv6_env_var,
       var.lambda_environment_variables,
