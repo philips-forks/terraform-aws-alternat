@@ -369,3 +369,9 @@ variable "enable_launch_script_lifecycle_hook" {
   type        = bool
   default     = false
 }
+
+variable "wait_for_capacity_timeout" {
+  description = "How long Terraform waits for the ASG to reach desired capacity. Set to \"0\" to make apply non-blocking (recommended for production to avoid hung applies during rolling instance replacements)."
+  type        = string
+  default     = "10m"
+}

@@ -94,6 +94,8 @@ resource "aws_autoscaling_group" "nat_instance" {
   max_instance_lifetime = var.max_instance_lifetime
   vpc_zone_identifier   = [each.value]
 
+  wait_for_capacity_timeout = var.wait_for_capacity_timeout
+
   launch_template {
     id      = aws_launch_template.nat_instance_template[each.key].id
     version = "$Latest"
