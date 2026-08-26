@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import shlex
 import time
 import urllib
 import urllib.error
@@ -46,6 +47,12 @@ DEFAULT_HAS_IPV6 = True
 
 METRIC_NAMESPACE = "AlterNAT"
 METRIC_ROUTE_STATE = "NATGatewayActive"
+
+# Minimum percentage of NAT-instance connectivity checks that must succeed for a
+# route restore to be considered safe. Prevents a single unreachable check URL
+# (e.g. an internal-only domain that does not resolve over public egress) from
+# blocking restore to an otherwise healthy NAT instance.
+DEFAULT_MIN_SUCCESS_PERCENT = 50
 
 
 # Overrides socket.getaddrinfo to perform IPv4 lookups
@@ -253,6 +260,34 @@ def publish_restore_failed():
     except Exception as e:
         logger.warning("Failed to publish RestoreFailed metric: %s", e)
 
+def get_min_success_percent():
+    """Minimum percent of check URLs that must succeed, from env (default 50)."""
+    try:
+        value = int(os.getenv("CONNECTIVITY_MIN_SUCCESS_PERCENT", DEFAULT_MIN_SUCCESS_PERCENT))
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_SUCCESS_PERCENT
+    return max(0, min(100, value))
+
+
+def restore_check_passed(http_codes):
+    """True if at least the configured percentage of curl HTTP codes indicate a
+    reachable host. A code of 000 (curl could not connect or resolve) or any 5xx
+    is a failure; 1xx-4xx means the network path is up."""
+    codes = [c.strip() for c in http_codes if c and c.strip()]
+    if not codes:
+        return False
+
+    def reachable(code):
+        try:
+            value = int(code)
+        except (TypeError, ValueError):
+            return False
+        return 0 < value < 500
+
+    successes = sum(1 for c in codes if reachable(c))
+    return (successes / len(codes)) * 100 >= get_min_success_percent()
+
+
 def attempt_nat_instance_restore():
     ssm_client = boto3.client('ssm')
     nat_instance_id = get_current_nat_instance_id(os.getenv("NAT_ASG_NAME"))
@@ -269,7 +304,11 @@ def attempt_nat_instance_restore():
         check_urls = os.getenv("CHECK_URLS", ",".join(DEFAULT_CHECK_URLS)).split(",")
         commands = []
         for url in check_urls:
-            command = f"curl -s -o /dev/null -w '%{{http_code}}\\n' --max-time 5 {url.strip()}"
+            # '|| echo 000' so a DNS/connection failure on one URL emits a 000
+            # sentinel instead of a non-zero exit, which would fail the whole SSM
+            # command and block restore even when other URLs are reachable.
+            # shlex.quote guards against shell metacharacters in a check URL.
+            command = f"curl -s -o /dev/null -w '%{{http_code}}\\n' --max-time 5 {shlex.quote(url.strip())} || echo 000"
             commands.append(command)
         # Send SSM command to test connectivity
         response = ssm_client.send_command(
@@ -292,8 +331,11 @@ def attempt_nat_instance_restore():
         if invocation['Status'] == "Success":
             output = invocation['StandardOutputContent'].strip()
             http_codes = output.splitlines()
-            if all(int(code) < 500 for code in http_codes):
-                logger.info("NAT instance has Internet access, we can diagnose the NAT configuration.")
+            if restore_check_passed(http_codes):
+                logger.info(
+                    "NAT instance reachable for at least %d%% of check URLs; proceeding with restore.",
+                    get_min_success_percent(),
+                )
                 try:
                     if not run_nat_instance_diagnostics(nat_instance_id):
                         logger.warning("Skipping route restore due to failed NAT diagnostics.")
@@ -308,7 +350,10 @@ def attempt_nat_instance_restore():
                     logger.info("Route table %s now points to NAT instance %s", rtb, nat_instance_id)
                 return
             else:
-                logger.warning("Invocation output: %s", invocation['StandardOutputContent'])
+                logger.warning(
+                    "NAT instance connectivity below %d%% success threshold; codes: %s",
+                    get_min_success_percent(), invocation['StandardOutputContent'],
+                )
                 publish_restore_failed()
         else:
             logger.warning("NAT instance connectivity test failed or did not return expected result.")

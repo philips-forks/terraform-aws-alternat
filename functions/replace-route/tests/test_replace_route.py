@@ -362,73 +362,94 @@ def test_run_nat_instance_diagnostics(mock_sleep):
 def test_attempt_nat_instance_restore(mock_sleep, monkeypatch):
     from app import attempt_nat_instance_restore
 
-    # Need to mock boto3.client to avoid calling AWS API
-    with mock.patch('boto3.client') as mock_boto_client:
-        # Mock AWS clients
-        mock_ssm = mock.MagicMock()
-        mock_ec2 = mock.MagicMock()
+    mock_ssm = mock.MagicMock()
+    mock_ec2 = mock.MagicMock()
 
-        def get_boto_client(service):
-            if service == 'ssm':
-                return mock_ssm
-            elif service == 'ec2':
-                return mock_ec2
-            return mock.MagicMock()
+    def get_boto_client(service):
+        if service == 'ssm':
+            return mock_ssm
+        elif service == 'ec2':
+            return mock_ec2
+        return mock.MagicMock()
 
-        mock_boto_client.side_effect = get_boto_client
-
-    # Setup environment
     route_tables = ['rtb-12345', 'rtb-67890']
     monkeypatch.setenv("ROUTE_TABLE_IDS_CSV", ",".join(route_tables))
     monkeypatch.setenv("NAT_ASG_NAME", "test-nat-asg")
+    # Five check URLs so the mocked SSM output (5 codes) matches the number of
+    # per-URL curl commands the code builds.
+    monkeypatch.setenv("CHECK_URLS", "https://a.example,https://b.example,https://c.example,https://d.example,https://e.example")
 
-    # Mock successful test and diagnostic
-    with mock.patch('app.get_current_nat_instance_id', return_value='i-test123'):
-        with mock.patch('app.run_nat_instance_diagnostics', return_value=True):
-            # Mock successful connectivity test
-            mock_ssm.send_command.return_value = {
-                'Command': {'CommandId': 'test-command-id'}
-            }
+    # Patch boto3.client for the whole body so the mocked SSM output actually
+    # drives attempt_nat_instance_restore (it calls boto3.client('ssm') itself).
+    with mock.patch('boto3.client', side_effect=get_boto_client):
+        mock_ssm.send_command.return_value = {'Command': {'CommandId': 'test-command-id'}}
+
+        # Successful restore: all URLs reachable.
+        with mock.patch('app.get_current_nat_instance_id', return_value='i-test123'):
+            with mock.patch('app.run_nat_instance_diagnostics', return_value=True):
+                mock_ssm.get_command_invocation.return_value = {
+                    'Status': 'Success',
+                    'StandardOutputContent': '200\n200\n200\n200\n200',
+                    'StandardErrorContent': ''
+                }
+                with mock.patch('app.replace_route') as mock_replace_route:
+                    attempt_nat_instance_restore()
+                    assert mock_replace_route.call_count == 2
+                    mock_replace_route.assert_any_call(route_tables[0], 'i-test123')
+                    mock_replace_route.assert_any_call(route_tables[1], 'i-test123')
+
+        # No internet: curl could not connect to any URL (0% reachable).
+        with mock.patch('app.get_current_nat_instance_id', return_value='i-test123'):
             mock_ssm.get_command_invocation.return_value = {
                 'Status': 'Success',
-                'StandardOutputContent': '200\n200',
-                'StandardErrorContent': ''
-            }
-
-            # Mock replace_route
-            with mock.patch('app.replace_route') as mock_replace_route:
-                # Test successful restore
-                attempt_nat_instance_restore()
-
-                # Verify replace_route called for both route tables
-                assert mock_replace_route.call_count == 2
-                mock_replace_route.assert_any_call(route_tables[0], 'i-test123')
-                mock_replace_route.assert_any_call(route_tables[1], 'i-test123')
-
-    # Test when NAT instance has no internet
-    with mock.patch('app.get_current_nat_instance_id', return_value='i-test123'):
-        mock_ssm.get_command_invocation.return_value = {
-            'Status': 'Success',
-            'StandardOutputContent': '404\n500',
-            'StandardErrorContent': ''
-        }
-        with mock.patch('app.replace_route') as mock_replace_route:
-            attempt_nat_instance_restore()
-            # Should not call replace_route
-            assert mock_replace_route.call_count == 0
-
-    # Test when diagnostics fail
-    with mock.patch('app.get_current_nat_instance_id', return_value='i-test123'):
-        with mock.patch('app.run_nat_instance_diagnostics', return_value=False):
-            mock_ssm.get_command_invocation.return_value = {
-                'Status': 'Success',
-                'StandardOutputContent': '200\n200',
+                'StandardOutputContent': '000\n000\n000\n000\n000',
                 'StandardErrorContent': ''
             }
             with mock.patch('app.replace_route') as mock_replace_route:
                 attempt_nat_instance_restore()
-                # Should not call replace_route
                 assert mock_replace_route.call_count == 0
+
+        # Diagnostics fail: connectivity fine but diagnostics say no.
+        with mock.patch('app.get_current_nat_instance_id', return_value='i-test123'):
+            with mock.patch('app.run_nat_instance_diagnostics', return_value=False):
+                mock_ssm.get_command_invocation.return_value = {
+                    'Status': 'Success',
+                    'StandardOutputContent': '200\n200\n200\n200\n200',
+                    'StandardErrorContent': ''
+                }
+                with mock.patch('app.replace_route') as mock_replace_route:
+                    attempt_nat_instance_restore()
+                    assert mock_replace_route.call_count == 0
+
+        # Partial failure: one check URL is unreachable (000) but the majority
+        # succeed. A single bad check URL (e.g. an internal-only domain that
+        # does not resolve over public egress) must not block restore of a
+        # healthy instance.
+        with mock.patch('app.get_current_nat_instance_id', return_value='i-test123'):
+            with mock.patch('app.run_nat_instance_diagnostics', return_value=True):
+                mock_ssm.get_command_invocation.return_value = {
+                    'Status': 'Success',
+                    'StandardOutputContent': '200\n200\n200\n200\n000',
+                    'StandardErrorContent': ''
+                }
+                with mock.patch('app.replace_route') as mock_replace_route:
+                    attempt_nat_instance_restore()
+                    # 4/5 reachable = 80% >= 50% default threshold -> restore
+                    assert mock_replace_route.call_count == 2
+
+
+def test_restore_check_passed(monkeypatch):
+    from app import restore_check_passed
+    # Default threshold is 50%.
+    assert restore_check_passed(['200', '200']) is True
+    assert restore_check_passed(['200', '000']) is True      # 50%
+    assert restore_check_passed(['000', '000']) is False     # 0%
+    assert restore_check_passed(['500', '200']) is True      # 5xx fails; 1/2 = 50%
+    assert restore_check_passed([]) is False
+    # Configurable via env var.
+    monkeypatch.setenv('CONNECTIVITY_MIN_SUCCESS_PERCENT', '100')
+    assert restore_check_passed(['200', '000']) is False     # 50% < 100%
+    assert restore_check_passed(['200', '200']) is True
 
 
 @mock_aws
