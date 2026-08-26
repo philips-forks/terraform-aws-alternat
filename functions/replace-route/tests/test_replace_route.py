@@ -375,6 +375,9 @@ def test_attempt_nat_instance_restore(mock_sleep, monkeypatch):
     route_tables = ['rtb-12345', 'rtb-67890']
     monkeypatch.setenv("ROUTE_TABLE_IDS_CSV", ",".join(route_tables))
     monkeypatch.setenv("NAT_ASG_NAME", "test-nat-asg")
+    # Five check URLs so the mocked SSM output (5 codes) matches the number of
+    # per-URL curl commands the code builds.
+    monkeypatch.setenv("CHECK_URLS", "https://a.example,https://b.example,https://c.example,https://d.example,https://e.example")
 
     # Patch boto3.client for the whole body so the mocked SSM output actually
     # drives attempt_nat_instance_restore (it calls boto3.client('ssm') itself).
@@ -386,7 +389,7 @@ def test_attempt_nat_instance_restore(mock_sleep, monkeypatch):
             with mock.patch('app.run_nat_instance_diagnostics', return_value=True):
                 mock_ssm.get_command_invocation.return_value = {
                     'Status': 'Success',
-                    'StandardOutputContent': '200\n200',
+                    'StandardOutputContent': '200\n200\n200\n200\n200',
                     'StandardErrorContent': ''
                 }
                 with mock.patch('app.replace_route') as mock_replace_route:
@@ -399,7 +402,7 @@ def test_attempt_nat_instance_restore(mock_sleep, monkeypatch):
         with mock.patch('app.get_current_nat_instance_id', return_value='i-test123'):
             mock_ssm.get_command_invocation.return_value = {
                 'Status': 'Success',
-                'StandardOutputContent': '000\n000',
+                'StandardOutputContent': '000\n000\n000\n000\n000',
                 'StandardErrorContent': ''
             }
             with mock.patch('app.replace_route') as mock_replace_route:
@@ -411,7 +414,7 @@ def test_attempt_nat_instance_restore(mock_sleep, monkeypatch):
             with mock.patch('app.run_nat_instance_diagnostics', return_value=False):
                 mock_ssm.get_command_invocation.return_value = {
                     'Status': 'Success',
-                    'StandardOutputContent': '200\n200',
+                    'StandardOutputContent': '200\n200\n200\n200\n200',
                     'StandardErrorContent': ''
                 }
                 with mock.patch('app.replace_route') as mock_replace_route:

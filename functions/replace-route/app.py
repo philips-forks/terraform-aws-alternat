@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import shlex
 import time
 import urllib
 import urllib.error
@@ -306,7 +307,8 @@ def attempt_nat_instance_restore():
             # '|| echo 000' so a DNS/connection failure on one URL emits a 000
             # sentinel instead of a non-zero exit, which would fail the whole SSM
             # command and block restore even when other URLs are reachable.
-            command = f"curl -s -o /dev/null -w '%{{http_code}}\\n' --max-time 5 {url.strip()} || echo 000"
+            # shlex.quote guards against shell metacharacters in a check URL.
+            command = f"curl -s -o /dev/null -w '%{{http_code}}\\n' --max-time 5 {shlex.quote(url.strip())} || echo 000"
             commands.append(command)
         # Send SSM command to test connectivity
         response = ssm_client.send_command(
