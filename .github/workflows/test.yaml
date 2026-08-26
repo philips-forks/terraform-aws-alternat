@@ -8,7 +8,9 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     env:
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+      # moto-based unit tests only need a region string, not real credentials.
+      # Fall back to a default so the job passes without the AWS_REGION secret.
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
     steps:
       - uses: actions/checkout@v4
 
