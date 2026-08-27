@@ -369,3 +369,15 @@ variable "enable_launch_script_lifecycle_hook" {
   type        = bool
   default     = false
 }
+
+variable "wait_for_capacity_timeout" {
+  description = "How long Terraform waits for the ASG to reach desired capacity. Set to \"0\" to make apply non-blocking (recommended for production to avoid hung applies during rolling instance replacements)."
+  type        = string
+  default     = "10m"
+}
+
+variable "enable_launch_before_terminating" {
+  description = "Launch a replacement NAT instance before terminating the old one (ASG instance maintenance policy 100/200). Provisions 2 EIPs per AZ so the replacement always has a free EIP to claim; the AZ alternates between its two EIPs each rotation. Both EIPs are created up front so they can be added to allow-lists in advance. Not compatible with nat_instance_eip_ids."
+  type        = bool
+  default     = false
+}

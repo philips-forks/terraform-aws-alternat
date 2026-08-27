@@ -53,6 +53,23 @@ locals {
     local.protected_ngw_eip_alloc_ids,
     local.explicit_ngw_eip_alloc_ids
   )
+
+  lbt_enabled = var.enable_launch_before_terminating
+
+  # Launch-before-terminate keeps each AZ's existing EIP as pool member 0 and
+  # adds one supplemental EIP as member 1, so enabling the feature destroys no
+  # in-use (or prevent_destroy) address. The AZ alternates between the two each
+  # rotation. Terminations are gated on the launch-script lifecycle hook so the
+  # old instance is not removed until the replacement has taken the route.
+  nat_instance_supplement_eips = var.prevent_destroy_eips ? aws_eip.protected_nat_instance_supplement : aws_eip.nat_instance_supplement
+  nat_instance_pool_ids_by_az = local.lbt_enabled ? {
+    for i, obj in var.vpc_az_maps : obj.az => [
+      local.nat_instance_eips[i].id,
+      local.nat_instance_supplement_eips[i].id,
+    ]
+  } : {}
+
+  launch_hook_enabled = var.enable_launch_script_lifecycle_hook || local.lbt_enabled
 }
 
 resource "aws_eip" "protected_nat_instance_eips" {
@@ -79,6 +96,26 @@ resource "aws_eip" "nat_instance_eips" {
   })
 }
 
+resource "aws_eip" "nat_instance_supplement" {
+  count = local.lbt_enabled && !var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
+
+  tags = merge(var.tags, {
+    "Name" = "${var.nat_instance_eip_name_prefix}supplement-${count.index}"
+  })
+}
+
+resource "aws_eip" "protected_nat_instance_supplement" {
+  count = local.lbt_enabled && var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
+
+  tags = merge(var.tags, {
+    "Name" = "${var.nat_instance_eip_name_prefix}supplement-${count.index}"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
 resource "aws_sns_topic" "alternat_topic" {
   name_prefix       = var.sns_topic_name_prefix
   kms_master_key_id = "alias/aws/sns"
@@ -93,6 +130,8 @@ resource "aws_autoscaling_group" "nat_instance" {
   min_size              = 1
   max_instance_lifetime = var.max_instance_lifetime
   vpc_zone_identifier   = [each.value]
+
+  wait_for_capacity_timeout = var.wait_for_capacity_timeout
 
   launch_template {
     id      = aws_launch_template.nat_instance_template[each.key].id
@@ -112,7 +151,22 @@ resource "aws_autoscaling_group" "nat_instance" {
     }
   }
 
-  health_check_grace_period = var.enable_launch_script_lifecycle_hook ? 0 : 300
+  health_check_grace_period = local.launch_hook_enabled ? 0 : 300
+
+  dynamic "instance_maintenance_policy" {
+    for_each = local.lbt_enabled ? [1] : []
+    content {
+      min_healthy_percentage = 100
+      max_healthy_percentage = 200
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = !(local.lbt_enabled && length(var.nat_instance_eip_ids) > 0)
+      error_message = "enable_launch_before_terminating is incompatible with nat_instance_eip_ids; the module manages its own per-AZ EIP pool."
+    }
+  }
 
   dynamic "tag" {
     for_each = merge(
@@ -130,7 +184,7 @@ resource "aws_autoscaling_group" "nat_instance" {
 }
 
 resource "aws_autoscaling_lifecycle_hook" "nat_instance_launch_script" {
-  for_each = var.enable_launch_script_lifecycle_hook ? toset([for obj in var.vpc_az_maps : obj.az]) : []
+  for_each = local.launch_hook_enabled ? toset([for obj in var.vpc_az_maps : obj.az]) : []
 
   autoscaling_group_name = aws_autoscaling_group.nat_instance[each.key].name
 
@@ -199,7 +253,7 @@ data "cloudinit_config" "config" {
   part {
     content_type = "text/x-shellscript"
     content = templatefile("${path.module}/alternat.conf.tftpl", {
-      eip_allocation_ids_csv  = join(",", local.nat_instance_eip_ids),
+      eip_allocation_ids_csv  = local.lbt_enabled ? join(",", local.nat_instance_pool_ids_by_az[each.key]) : join(",", local.nat_instance_eip_ids),
       route_table_ids_csv     = join(",", each.value),
       enable_ssm              = var.enable_ssm,
       enable_cloudwatch_agent = var.enable_cloudwatch_agent
