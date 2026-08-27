@@ -1,16 +1,17 @@
 
 output "nat_instance_eips" {
-  description = "List of Elastic IP addresses used by the NAT instances. This will be empty if EIPs are provided in var.nat_instance_eip_ids or when enable_launch_before_terminating is set (see nat_instance_pool_eips)."
-  value = (local.lbt_enabled || local.reuse_nat_instance_eips
+  description = "List of Elastic IP addresses used by the NAT instances. This will be empty if EIPs are provided in var.nat_instance_eip_ids. When enable_launch_before_terminating is set these are pool member 0; see nat_instance_pool_eips for the full per-AZ pool."
+  value = (local.reuse_nat_instance_eips
     ? []
   : local.nat_instance_eips[*].public_ip)
 }
 
 output "nat_instance_pool_eips" {
-  description = "Map of AZ to the pool of NAT instance EIPs used for launch-before-terminate rotation. Empty unless enable_launch_before_terminating. Add all of these to allow-lists."
+  description = "Map of AZ to the full pool of NAT instance EIPs used for launch-before-terminate rotation (member 0 = the existing EIP, member 1 = the supplement). Empty unless enable_launch_before_terminating. Add all of these to allow-lists."
   value = local.lbt_enabled ? {
-    for obj in var.vpc_az_maps : obj.az => [
-      for k, eip in local.nat_instance_pool_eips : eip.public_ip if local.nat_instance_pool_map[k] == obj.az
+    for i, obj in var.vpc_az_maps : obj.az => [
+      local.nat_instance_eips[i].public_ip,
+      local.nat_instance_supplement_eips[i].public_ip,
     ]
   } : {}
 }

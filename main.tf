@@ -56,23 +56,24 @@ locals {
 
   lbt_enabled = var.enable_launch_before_terminating
 
-  # 2 EIPs per AZ keyed "${az}-${idx}" so a replacement instance always has a
-  # free EIP to claim; the AZ alternates between its two EIPs each rotation.
-  nat_instance_pool_map = local.lbt_enabled ? merge([
-    for obj in var.vpc_az_maps : {
-      for idx in range(2) : "${obj.az}-${idx}" => obj.az
-    }
-  ]...) : {}
-  nat_instance_pool_eips = var.prevent_destroy_eips ? aws_eip.protected_nat_instance_pool : aws_eip.nat_instance_pool
-  nat_instance_pool_ids_by_az = {
-    for obj in var.vpc_az_maps : obj.az => [
-      for k, eip in local.nat_instance_pool_eips : eip.id if local.nat_instance_pool_map[k] == obj.az
+  # Launch-before-terminate keeps each AZ's existing EIP as pool member 0 and
+  # adds one supplemental EIP as member 1, so enabling the feature destroys no
+  # in-use (or prevent_destroy) address. The AZ alternates between the two each
+  # rotation. Terminations are gated on the launch-script lifecycle hook so the
+  # old instance is not removed until the replacement has taken the route.
+  nat_instance_supplement_eips = var.prevent_destroy_eips ? aws_eip.protected_nat_instance_supplement : aws_eip.nat_instance_supplement
+  nat_instance_pool_ids_by_az = local.lbt_enabled ? {
+    for i, obj in var.vpc_az_maps : obj.az => [
+      local.nat_instance_eips[i].id,
+      local.nat_instance_supplement_eips[i].id,
     ]
-  }
+  } : {}
+
+  launch_hook_enabled = var.enable_launch_script_lifecycle_hook || local.lbt_enabled
 }
 
 resource "aws_eip" "protected_nat_instance_eips" {
-  count = (local.lbt_enabled || local.reuse_nat_instance_eips
+  count = (local.reuse_nat_instance_eips
     ? 0
   : var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0)
 
@@ -86,7 +87,7 @@ resource "aws_eip" "protected_nat_instance_eips" {
 }
 
 resource "aws_eip" "nat_instance_eips" {
-  count = (local.lbt_enabled || local.reuse_nat_instance_eips
+  count = (local.reuse_nat_instance_eips
     ? 0
   : (var.prevent_destroy_eips ? 0 : length(var.vpc_az_maps)))
 
@@ -95,21 +96,19 @@ resource "aws_eip" "nat_instance_eips" {
   })
 }
 
-resource "aws_eip" "nat_instance_pool" {
-  for_each = var.prevent_destroy_eips ? {} : local.nat_instance_pool_map
+resource "aws_eip" "nat_instance_supplement" {
+  count = local.lbt_enabled && !var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
 
   tags = merge(var.tags, {
-    "Name"        = "${var.nat_instance_eip_name_prefix}${each.key}"
-    "alternat:az" = each.value
+    "Name" = "${var.nat_instance_eip_name_prefix}supplement-${count.index}"
   })
 }
 
-resource "aws_eip" "protected_nat_instance_pool" {
-  for_each = var.prevent_destroy_eips ? local.nat_instance_pool_map : {}
+resource "aws_eip" "protected_nat_instance_supplement" {
+  count = local.lbt_enabled && var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
 
   tags = merge(var.tags, {
-    "Name"        = "${var.nat_instance_eip_name_prefix}${each.key}"
-    "alternat:az" = each.value
+    "Name" = "${var.nat_instance_eip_name_prefix}supplement-${count.index}"
   })
 
   lifecycle {
@@ -152,13 +151,20 @@ resource "aws_autoscaling_group" "nat_instance" {
     }
   }
 
-  health_check_grace_period = var.enable_launch_script_lifecycle_hook ? 0 : 300
+  health_check_grace_period = local.launch_hook_enabled ? 0 : 300
 
   dynamic "instance_maintenance_policy" {
     for_each = local.lbt_enabled ? [1] : []
     content {
       min_healthy_percentage = 100
       max_healthy_percentage = 200
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = !(local.lbt_enabled && length(var.nat_instance_eip_ids) > 0)
+      error_message = "enable_launch_before_terminating is incompatible with nat_instance_eip_ids; the module manages its own per-AZ EIP pool."
     }
   }
 
@@ -178,7 +184,7 @@ resource "aws_autoscaling_group" "nat_instance" {
 }
 
 resource "aws_autoscaling_lifecycle_hook" "nat_instance_launch_script" {
-  for_each = var.enable_launch_script_lifecycle_hook ? toset([for obj in var.vpc_az_maps : obj.az]) : []
+  for_each = local.launch_hook_enabled ? toset([for obj in var.vpc_az_maps : obj.az]) : []
 
   autoscaling_group_name = aws_autoscaling_group.nat_instance[each.key].name
 
