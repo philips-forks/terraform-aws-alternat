@@ -83,6 +83,22 @@ variable "enable_nat_restore" {
   default     = false
 }
 
+variable "failback_parameter_name_prefix" {
+  description = <<-EOT
+    Prefix of consumer-managed SSM parameters holding per-AZ failback state, without a trailing slash
+    (e.g. "/alternat/staging/failback", read as "<prefix>/<az>"). When a parameter reads true, the
+    connectivity tester skips restoring that AZ's route to the NAT instance, so a deliberate failback
+    is not undone by an in-flight tester run. Empty disables the check. Requires enable_nat_restore.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.failback_parameter_name_prefix == "" || !endswith(var.failback_parameter_name_prefix, "/")
+    error_message = "failback_parameter_name_prefix must not end with a trailing slash."
+  }
+}
+
 variable "ingress_security_group_ids" {
   description = "A list of security group IDs that are allowed by the NAT instance."
   type        = list(string)
