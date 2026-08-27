@@ -614,3 +614,36 @@ def test_attempt_nat_instance_restore_aborts_on_late_failback(mock_sleep, monkey
              mock.patch('app.replace_route') as mock_replace_route:
             attempt_nat_instance_restore()
             mock_replace_route.assert_not_called()
+
+
+@mock_aws
+@mock.patch('time.sleep')
+def test_attempt_nat_instance_restore_aborts_between_route_tables(mock_sleep, monkeypatch):
+    """A failback starting between two route writes must leave the remaining routes alone."""
+    from app import attempt_nat_instance_restore
+
+    mock_ssm = mock.MagicMock()
+
+    def get_boto_client(service, *args, **kwargs):
+        if service == 'ssm':
+            return mock_ssm
+        return mock.MagicMock()
+
+    monkeypatch.setenv("ROUTE_TABLE_IDS_CSV", "rtb-11111,rtb-22222,rtb-33333")
+    monkeypatch.setenv("NAT_ASG_NAME", "test-nat-asg")
+    monkeypatch.setenv("CHECK_URLS", "https://a.example")
+
+    with mock.patch('boto3.client', side_effect=get_boto_client):
+        mock_ssm.send_command.return_value = {'Command': {'CommandId': 'test-command-id'}}
+        mock_ssm.get_command_invocation.return_value = {
+            'Status': 'Success',
+            'StandardOutputContent': '200',
+            'StandardErrorContent': ''
+        }
+        # Clear for the first route table, then a failback starts.
+        with mock.patch('app.get_current_nat_instance_id', return_value='i-test123'), \
+             mock.patch('app.run_nat_instance_diagnostics', return_value=True), \
+             mock.patch('app.is_failback_in_effect', side_effect=[False, True]), \
+             mock.patch('app.replace_route') as mock_replace_route:
+            attempt_nat_instance_restore()
+            mock_replace_route.assert_called_once_with("rtb-11111", "i-test123")

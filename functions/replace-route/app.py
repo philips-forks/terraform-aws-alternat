@@ -380,12 +380,13 @@ def attempt_nat_instance_restore():
                     logger.error("Unexpected error during NAT diagnostics: %s", str(diag_error))
                     publish_restore_failed()
                     return
-                # Re-check: the SSM round trip above takes long enough for a
-                # failback to have started since the caller's check.
-                if is_failback_in_effect():
-                    logger.info("Failback started during restore checks. Abandoning restore.")
-                    return
                 for rtb in route_tables:
+                    # Re-checked per route table, not once per batch: the SSM
+                    # round trip above and each route write are long enough for
+                    # a failback to begin part-way through.
+                    if is_failback_in_effect():
+                        logger.info("Failback in effect. Abandoning restore of remaining route tables.")
+                        return
                     replace_route(rtb, nat_instance_id)
                     logger.info("Route table %s now points to NAT instance %s", rtb, nat_instance_id)
                 return
