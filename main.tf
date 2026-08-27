@@ -53,10 +53,26 @@ locals {
     local.protected_ngw_eip_alloc_ids,
     local.explicit_ngw_eip_alloc_ids
   )
+
+  lbt_enabled = var.enable_launch_before_terminating
+
+  # 2 EIPs per AZ keyed "${az}-${idx}" so a replacement instance always has a
+  # free EIP to claim; the AZ alternates between its two EIPs each rotation.
+  nat_instance_pool_map = local.lbt_enabled ? merge([
+    for obj in var.vpc_az_maps : {
+      for idx in range(2) : "${obj.az}-${idx}" => obj.az
+    }
+  ]...) : {}
+  nat_instance_pool_eips = var.prevent_destroy_eips ? aws_eip.protected_nat_instance_pool : aws_eip.nat_instance_pool
+  nat_instance_pool_ids_by_az = {
+    for obj in var.vpc_az_maps : obj.az => [
+      for k, eip in local.nat_instance_pool_eips : eip.id if local.nat_instance_pool_map[k] == obj.az
+    ]
+  }
 }
 
 resource "aws_eip" "protected_nat_instance_eips" {
-  count = (local.reuse_nat_instance_eips
+  count = (local.lbt_enabled || local.reuse_nat_instance_eips
     ? 0
   : var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0)
 
@@ -70,13 +86,35 @@ resource "aws_eip" "protected_nat_instance_eips" {
 }
 
 resource "aws_eip" "nat_instance_eips" {
-  count = (local.reuse_nat_instance_eips
+  count = (local.lbt_enabled || local.reuse_nat_instance_eips
     ? 0
   : (var.prevent_destroy_eips ? 0 : length(var.vpc_az_maps)))
 
   tags = merge(var.tags, {
     "Name" = "${var.nat_instance_eip_name_prefix}${count.index}"
   })
+}
+
+resource "aws_eip" "nat_instance_pool" {
+  for_each = var.prevent_destroy_eips ? {} : local.nat_instance_pool_map
+
+  tags = merge(var.tags, {
+    "Name"        = "${var.nat_instance_eip_name_prefix}${each.key}"
+    "alternat:az" = each.value
+  })
+}
+
+resource "aws_eip" "protected_nat_instance_pool" {
+  for_each = var.prevent_destroy_eips ? local.nat_instance_pool_map : {}
+
+  tags = merge(var.tags, {
+    "Name"        = "${var.nat_instance_eip_name_prefix}${each.key}"
+    "alternat:az" = each.value
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_sns_topic" "alternat_topic" {
@@ -115,6 +153,14 @@ resource "aws_autoscaling_group" "nat_instance" {
   }
 
   health_check_grace_period = var.enable_launch_script_lifecycle_hook ? 0 : 300
+
+  dynamic "instance_maintenance_policy" {
+    for_each = local.lbt_enabled ? [1] : []
+    content {
+      min_healthy_percentage = 100
+      max_healthy_percentage = 200
+    }
+  }
 
   dynamic "tag" {
     for_each = merge(
@@ -201,7 +247,7 @@ data "cloudinit_config" "config" {
   part {
     content_type = "text/x-shellscript"
     content = templatefile("${path.module}/alternat.conf.tftpl", {
-      eip_allocation_ids_csv  = join(",", local.nat_instance_eip_ids),
+      eip_allocation_ids_csv  = local.lbt_enabled ? join(",", local.nat_instance_pool_ids_by_az[each.key]) : join(",", local.nat_instance_eip_ids),
       route_table_ids_csv     = join(",", each.value),
       enable_ssm              = var.enable_ssm,
       enable_cloudwatch_agent = var.enable_cloudwatch_agent
