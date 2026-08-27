@@ -6,6 +6,12 @@ locals {
   }
   has_ipv6_env_var = { "HAS_IPV6" = var.lambda_has_ipv6 }
   lambda_runtime   = "python3.12"
+
+  failback_parameter_names = {
+    for obj in var.vpc_az_maps : obj.az => (
+      var.failback_parameter_name_prefix == "" ? "" : "${var.failback_parameter_name_prefix}/${obj.az}"
+    )
+  }
 }
 
 resource "archive_file" "lambda" {
@@ -177,6 +183,9 @@ resource "aws_lambda_function" "alternat_connectivity_tester" {
         # Required by publish_nat_gateway_active; ENVIRONMENT is expected from
         # lambda_environment_variables passed by the consumer module.
         AVAILABILITY_ZONE = each.key
+        # Empty unless the consumer runs a failback mechanism, in which case the
+        # tester must not restore an AZ that was deliberately failed back.
+        FAILBACK_PARAMETER_NAME = local.failback_parameter_names[each.key]
       },
       local.has_ipv6_env_var,
       var.lambda_environment_variables,
@@ -282,4 +291,30 @@ resource "aws_iam_role_policy" "lambda_ssm_send_command_policy" {
   name   = "AllowLambdaToSendSSMCommand"
   role   = aws_iam_role.nat_lambda_role.id
   policy = data.aws_iam_policy_document.lambda_ssm_send_command_document.json
+}
+
+# Lets the connectivity tester see whether the consumer's failback mechanism has
+# pinned an AZ to the NAT Gateway, so it does not restore the route underneath it.
+data "aws_iam_policy_document" "lambda_failback_parameter_document" {
+  count = var.failback_parameter_name_prefix == "" ? 0 : 1
+
+  statement {
+    sid    = "AllowLambdaToReadFailbackState"
+    effect = "Allow"
+
+    actions = [
+      "ssm:GetParameter",
+    ]
+
+    resources = [
+      "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.id}:parameter${var.failback_parameter_name_prefix}/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "lambda_failback_parameter_policy" {
+  count  = var.failback_parameter_name_prefix == "" ? 0 : 1
+  name   = "AllowLambdaToReadFailbackState"
+  role   = aws_iam_role.nat_lambda_role.id
+  policy = data.aws_iam_policy_document.lambda_failback_parameter_document[0].json
 }

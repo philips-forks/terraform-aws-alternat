@@ -83,6 +83,26 @@ variable "enable_nat_restore" {
   default     = false
 }
 
+variable "failback_parameter_name_prefix" {
+  description = <<-EOT
+    Prefix of consumer-managed SSM parameters holding per-AZ failback state, as an absolute parameter
+    path with no trailing slash (e.g. "/alternat/staging/failback", read as "<prefix>/<az>"). When a
+    parameter reads true, the connectivity tester skips restoring that AZ's route to the NAT instance,
+    so a deliberate failback is not undone by an in-flight tester run. Empty disables the check.
+    Requires enable_nat_restore.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    # A leading slash is required: the IAM policy builds "...:parameter${prefix}/*", and SSM
+    # parameter ARNs always contain "parameter/". Expressed as a regex rather than startswith/
+    # endswith so the module still works on the Terraform 1.1 floor in versions.tf.
+    condition     = var.failback_parameter_name_prefix == "" || can(regex("^(/[^/]+)+$", var.failback_parameter_name_prefix))
+    error_message = "failback_parameter_name_prefix must be an absolute parameter path such as \"/alternat/staging/failback\": it must start with \"/\", must not end with \"/\", and must not contain empty path segments."
+  }
+}
+
 variable "ingress_security_group_ids" {
   description = "A list of security group IDs that are allowed by the NAT instance."
   type        = list(string)

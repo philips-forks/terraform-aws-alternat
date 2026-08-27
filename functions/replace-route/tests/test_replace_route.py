@@ -494,3 +494,156 @@ def test_nat_restore_option(mock_sleep, monkeypatch):
             with mock.patch('app.attempt_nat_instance_restore') as mock_restore:
                 connectivity_test_handler(event=json.loads(cloudwatch_event), context=Context())
                 mock_restore.assert_called_once()  # Should try to restore
+
+
+def _ssm_client_returning(get_parameter):
+    mock_ssm = mock.MagicMock()
+    mock_ssm.get_parameter = get_parameter
+
+    def get_boto_client(service, *args, **kwargs):
+        if service == 'ssm':
+            return mock_ssm
+        return mock.MagicMock()
+
+    return get_boto_client
+
+
+def _client_error(code):
+    return botocore.exceptions.ClientError({'Error': {'Code': code, 'Message': code}}, 'GetParameter')
+
+
+def test_is_failback_in_effect_unset_env(monkeypatch):
+    from app import is_failback_in_effect
+    monkeypatch.delenv("FAILBACK_PARAMETER_NAME", raising=False)
+    assert is_failback_in_effect() is False
+
+
+def test_is_failback_in_effect_reads_parameter_value(monkeypatch):
+    from app import is_failback_in_effect
+    monkeypatch.setenv("FAILBACK_PARAMETER_NAME", "/alternat/test/failback/us-east-1a")
+
+    for value, expected in [("true", True), ("True", True), ("1", True), (" true ", True),
+                            ("false", False), ("", False), ("nonsense", False)]:
+        get_parameter = mock.MagicMock(return_value={'Parameter': {'Value': value}})
+        with mock.patch('boto3.client', side_effect=_ssm_client_returning(get_parameter)):
+            assert is_failback_in_effect() is expected, f"value={value!r}"
+        get_parameter.assert_called_once_with(Name="/alternat/test/failback/us-east-1a")
+
+
+def test_is_failback_in_effect_missing_parameter_allows_restore(monkeypatch):
+    from app import is_failback_in_effect
+    monkeypatch.setenv("FAILBACK_PARAMETER_NAME", "/alternat/test/failback/us-east-1a")
+
+    get_parameter = mock.MagicMock(side_effect=_client_error('ParameterNotFound'))
+    with mock.patch('boto3.client', side_effect=_ssm_client_returning(get_parameter)):
+        # Never provisioned means no failback was ever recorded, so restore may proceed.
+        assert is_failback_in_effect() is False
+
+
+def test_is_failback_in_effect_fails_closed(monkeypatch):
+    from app import is_failback_in_effect
+    monkeypatch.setenv("FAILBACK_PARAMETER_NAME", "/alternat/test/failback/us-east-1a")
+
+    for side_effect in [_client_error('AccessDeniedException'),
+                        _client_error('ThrottlingException'),
+                        RuntimeError("boom")]:
+        get_parameter = mock.MagicMock(side_effect=side_effect)
+        with mock.patch('boto3.client', side_effect=_ssm_client_returning(get_parameter)):
+            # Unreadable state must never undo a deliberate failback.
+            assert is_failback_in_effect() is True
+
+
+@mock_aws
+@mock.patch('time.sleep')
+def test_failback_in_effect_skips_restore(mock_sleep, monkeypatch):
+    from app import connectivity_test_handler
+    mocked_networking = setup_networking()
+
+    script_dir = os.path.dirname(__file__)
+    with open(os.path.join(script_dir, "../cloudwatch-event.json"), "r") as file:
+        cloudwatch_event = file.read()
+
+    class Context:
+        function_name = "alternat-connectivity-test"
+
+    monkeypatch.setenv("ROUTE_TABLE_IDS_CSV", ",".join([mocked_networking["route_table"], mocked_networking["route_table_two"]]))
+    monkeypatch.setenv("PUBLIC_SUBNET_ID", mocked_networking["public_subnet"])
+    monkeypatch.setenv("NAT_ASG_NAME", "alternat-nat-asg")
+    monkeypatch.setenv("CONNECTIVITY_CHECK_INTERVAL", "60")
+    monkeypatch.setenv("ENABLE_NAT_RESTORE", "true")
+
+    with mock.patch('urllib.request.urlopen'), \
+         mock.patch('app.are_any_routes_pointing_to_nat_gateway', return_value=True), \
+         mock.patch('app.attempt_nat_instance_restore') as mock_restore:
+        with mock.patch('app.is_failback_in_effect', return_value=True):
+            connectivity_test_handler(event=json.loads(cloudwatch_event), context=Context())
+            mock_restore.assert_not_called()
+
+        with mock.patch('app.is_failback_in_effect', return_value=False):
+            connectivity_test_handler(event=json.loads(cloudwatch_event), context=Context())
+            mock_restore.assert_called_once()
+
+
+@mock_aws
+@mock.patch('time.sleep')
+def test_attempt_nat_instance_restore_aborts_on_late_failback(mock_sleep, monkeypatch):
+    """A failback starting during the SSM round trip must abort the restore."""
+    from app import attempt_nat_instance_restore
+
+    mock_ssm = mock.MagicMock()
+
+    def get_boto_client(service, *args, **kwargs):
+        if service == 'ssm':
+            return mock_ssm
+        return mock.MagicMock()
+
+    monkeypatch.setenv("ROUTE_TABLE_IDS_CSV", "rtb-12345,rtb-67890")
+    monkeypatch.setenv("NAT_ASG_NAME", "test-nat-asg")
+    monkeypatch.setenv("CHECK_URLS", "https://a.example,https://b.example")
+
+    with mock.patch('boto3.client', side_effect=get_boto_client):
+        mock_ssm.send_command.return_value = {'Command': {'CommandId': 'test-command-id'}}
+        mock_ssm.get_command_invocation.return_value = {
+            'Status': 'Success',
+            'StandardOutputContent': '200\n200',
+            'StandardErrorContent': ''
+        }
+        with mock.patch('app.get_current_nat_instance_id', return_value='i-test123'), \
+             mock.patch('app.run_nat_instance_diagnostics', return_value=True), \
+             mock.patch('app.is_failback_in_effect', return_value=True), \
+             mock.patch('app.replace_route') as mock_replace_route:
+            attempt_nat_instance_restore()
+            mock_replace_route.assert_not_called()
+
+
+@mock_aws
+@mock.patch('time.sleep')
+def test_attempt_nat_instance_restore_aborts_between_route_tables(mock_sleep, monkeypatch):
+    """A failback starting between two route writes must leave the remaining routes alone."""
+    from app import attempt_nat_instance_restore
+
+    mock_ssm = mock.MagicMock()
+
+    def get_boto_client(service, *args, **kwargs):
+        if service == 'ssm':
+            return mock_ssm
+        return mock.MagicMock()
+
+    monkeypatch.setenv("ROUTE_TABLE_IDS_CSV", "rtb-11111,rtb-22222,rtb-33333")
+    monkeypatch.setenv("NAT_ASG_NAME", "test-nat-asg")
+    monkeypatch.setenv("CHECK_URLS", "https://a.example")
+
+    with mock.patch('boto3.client', side_effect=get_boto_client):
+        mock_ssm.send_command.return_value = {'Command': {'CommandId': 'test-command-id'}}
+        mock_ssm.get_command_invocation.return_value = {
+            'Status': 'Success',
+            'StandardOutputContent': '200',
+            'StandardErrorContent': ''
+        }
+        # Clear for the first route table, then a failback starts.
+        with mock.patch('app.get_current_nat_instance_id', return_value='i-test123'), \
+             mock.patch('app.run_nat_instance_diagnostics', return_value=True), \
+             mock.patch('app.is_failback_in_effect', side_effect=[False, True]), \
+             mock.patch('app.replace_route') as mock_replace_route:
+            attempt_nat_instance_restore()
+            mock_replace_route.assert_called_once_with("rtb-11111", "i-test123")
