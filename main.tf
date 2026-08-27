@@ -64,10 +64,16 @@ locals {
   # gated on the launch-script lifecycle hook so the old instance is not removed
   # until the replacement has taken the route.
   nat_instance_supplement_eips = var.prevent_destroy_eips ? aws_eip.protected_nat_instance_supplement : aws_eip.nat_instance_supplement
+
+  # Member 1 (the supplement) is either provided (pre-provisioned externally,
+  # one per AZ aligned with vpc_az_maps) or created by this module.
+  reuse_supplement_eips               = local.lbt_enabled && length(var.nat_instance_supplement_eip_ids) == length(var.vpc_az_maps)
+  nat_instance_supplement_member1_ids = local.reuse_supplement_eips ? var.nat_instance_supplement_eip_ids : local.nat_instance_supplement_eips[*].id
+
   nat_instance_pool_ids_by_az = local.lbt_enabled ? {
     for i, obj in var.vpc_az_maps : obj.az => [
       local.nat_instance_eip_ids[i],
-      local.nat_instance_supplement_eips[i].id,
+      local.nat_instance_supplement_member1_ids[i],
     ]
   } : {}
 
@@ -99,7 +105,7 @@ resource "aws_eip" "nat_instance_eips" {
 }
 
 resource "aws_eip" "nat_instance_supplement" {
-  count = local.lbt_enabled && !var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
+  count = local.lbt_enabled && !local.reuse_supplement_eips && !var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
 
   tags = merge(var.tags, {
     "Name" = "${var.nat_instance_eip_name_prefix}supplement-${count.index}"
@@ -107,7 +113,7 @@ resource "aws_eip" "nat_instance_supplement" {
 }
 
 resource "aws_eip" "protected_nat_instance_supplement" {
-  count = local.lbt_enabled && var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
+  count = local.lbt_enabled && !local.reuse_supplement_eips && var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
 
   tags = merge(var.tags, {
     "Name" = "${var.nat_instance_eip_name_prefix}supplement-${count.index}"

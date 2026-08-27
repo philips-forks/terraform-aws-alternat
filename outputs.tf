@@ -7,8 +7,8 @@ output "nat_instance_eips" {
 }
 
 output "nat_instance_supplement_eips" {
-  description = "List of supplemental EIP public IPs created for launch-before-terminate rotation (pool member 1). Empty unless enable_launch_before_terminating. Add these to allow-lists alongside the member-0 EIPs."
-  value       = local.lbt_enabled ? local.nat_instance_supplement_eips[*].public_ip : []
+  description = "List of supplemental EIP public IPs created by this module for launch-before-terminate rotation (pool member 1). Empty unless enable_launch_before_terminating, and empty when supplement EIPs are provided via nat_instance_supplement_eip_ids (the caller then owns their public IPs)."
+  value       = local.lbt_enabled && !local.reuse_supplement_eips ? local.nat_instance_supplement_eips[*].public_ip : []
 }
 
 output "nat_gateway_eips" {
