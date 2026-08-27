@@ -45,6 +45,12 @@ DEFAULT_ENABLE_NAT_RESTORE = False
 # Whether or not use IPv6.
 DEFAULT_HAS_IPV6 = True
 
+TRUE_VALUES = ["t", "true", "y", "yes", "1"]
+
+# Consumer-managed SSM parameter marking this AZ as deliberately pinned to the
+# NAT Gateway. Unset means the consumer has not wired a failback mechanism.
+FAILBACK_PARAMETER_NAME_ENV = "FAILBACK_PARAMETER_NAME"
+
 METRIC_NAMESPACE = "AlterNAT"
 METRIC_ROUTE_STATE = "NATGatewayActive"
 
@@ -288,6 +294,35 @@ def restore_check_passed(http_codes):
     return (successes / len(codes)) * 100 >= get_min_success_percent()
 
 
+def is_failback_in_effect():
+    """Return True when an operator or alarm has pinned this AZ to the NAT Gateway.
+
+    Read on every restore decision rather than cached, because a failback can
+    begin part-way through a tester invocation.
+
+    Fails closed: an unreadable parameter suppresses restore. Wrongly restoring
+    silently undoes a deliberate failback, while wrongly skipping only leaves
+    traffic on the NAT Gateway, which already alarms if it persists.
+    """
+    parameter_name = os.getenv(FAILBACK_PARAMETER_NAME_ENV, "")
+    if not parameter_name:
+        return False
+
+    try:
+        response = boto3.client("ssm").get_parameter(Name=parameter_name)
+    except botocore.exceptions.ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ParameterNotFound":
+            # Never provisioned, so no failback has ever been recorded.
+            return False
+        logger.error("Could not read %s: %s. Skipping restore.", parameter_name, e)
+        return True
+    except Exception as e:
+        logger.error("Unexpected error reading %s: %s. Skipping restore.", parameter_name, e)
+        return True
+
+    return response["Parameter"]["Value"].strip().lower() in TRUE_VALUES
+
+
 def attempt_nat_instance_restore():
     ssm_client = boto3.client('ssm')
     nat_instance_id = get_current_nat_instance_id(os.getenv("NAT_ASG_NAME"))
@@ -344,6 +379,11 @@ def attempt_nat_instance_restore():
                 except Exception as diag_error:
                     logger.error("Unexpected error during NAT diagnostics: %s", str(diag_error))
                     publish_restore_failed()
+                    return
+                # Re-check: the SSM round trip above takes long enough for a
+                # failback to have started since the caller's check.
+                if is_failback_in_effect():
+                    logger.info("Failback started during restore checks. Abandoning restore.")
                     return
                 for rtb in route_tables:
                     replace_route(rtb, nat_instance_id)
@@ -408,7 +448,8 @@ def check_connection(check_urls):
 
     If ENABLE_NAT_RESTORE is set and the route is currently on the NAT Gateway,
     the restore attempt runs AFTER confirming connectivity, so that an SSM hang
-    cannot delay failover detection.
+    cannot delay failover detection. Restore is skipped entirely while the
+    FAILBACK_PARAMETER_NAME parameter marks this AZ as deliberately failed back.
     """
     route_tables = [r for r in os.getenv("ROUTE_TABLE_IDS_CSV", "").split(",") if r]
     if not route_tables:
@@ -423,8 +464,11 @@ def check_connection(check_urls):
         # move back to the NAT instance. This runs after the connectivity check
         # so an SSM hang here cannot prevent failover detection.
         if restore_enabled and on_gateway:
-            logger.info("ENABLE_NAT_RESTORE=true and route is NAT Gateway. Trying to restore NAT instance...")
-            attempt_nat_instance_restore()
+            if is_failback_in_effect():
+                logger.info("Failback in effect for this AZ. Skipping NAT instance restore.")
+            else:
+                logger.info("ENABLE_NAT_RESTORE=true and route is NAT Gateway. Trying to restore NAT instance...")
+                attempt_nat_instance_restore()
         return True
 
     # Step 2: All URLs failed — switch route to standby NAT Gateway
@@ -521,8 +565,7 @@ def connectivity_test_handler(event, context):
 
 def get_env_bool(var_name, default_value=False):
     value = os.getenv(var_name, default_value)
-    true_values = ["t", "true", "y", "yes", "1"]
-    return str(value).lower() in true_values
+    return str(value).lower() in TRUE_VALUES
 
 
 def complete_asg_lifecycle_action(
