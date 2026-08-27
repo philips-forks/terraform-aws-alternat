@@ -58,14 +58,22 @@ locals {
 
   # Launch-before-terminate keeps each AZ's existing EIP as pool member 0 and
   # adds one supplemental EIP as member 1, so enabling the feature destroys no
-  # in-use (or prevent_destroy) address. The AZ alternates between the two each
-  # rotation. Terminations are gated on the launch-script lifecycle hook so the
-  # old instance is not removed until the replacement has taken the route.
+  # in-use (or prevent_destroy) address. Member 0 is whatever the AZ already
+  # uses: a preserved/provided EIP (nat_instance_eip_ids) or a module-created
+  # one. The AZ alternates between the two each rotation, and terminations are
+  # gated on the launch-script lifecycle hook so the old instance is not removed
+  # until the replacement has taken the route.
   nat_instance_supplement_eips = var.prevent_destroy_eips ? aws_eip.protected_nat_instance_supplement : aws_eip.nat_instance_supplement
+
+  # Member 1 (the supplement) is either provided (pre-provisioned externally,
+  # one per AZ aligned with vpc_az_maps) or created by this module.
+  reuse_supplement_eips               = local.lbt_enabled && length(var.nat_instance_supplement_eip_ids) == length(var.vpc_az_maps)
+  nat_instance_supplement_member1_ids = local.reuse_supplement_eips ? var.nat_instance_supplement_eip_ids : local.nat_instance_supplement_eips[*].id
+
   nat_instance_pool_ids_by_az = local.lbt_enabled ? {
     for i, obj in var.vpc_az_maps : obj.az => [
-      local.nat_instance_eips[i].id,
-      local.nat_instance_supplement_eips[i].id,
+      local.nat_instance_eip_ids[i],
+      local.nat_instance_supplement_member1_ids[i],
     ]
   } : {}
 
@@ -97,7 +105,7 @@ resource "aws_eip" "nat_instance_eips" {
 }
 
 resource "aws_eip" "nat_instance_supplement" {
-  count = local.lbt_enabled && !var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
+  count = local.lbt_enabled && !local.reuse_supplement_eips && !var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
 
   tags = merge(var.tags, {
     "Name" = "${var.nat_instance_eip_name_prefix}supplement-${count.index}"
@@ -105,7 +113,7 @@ resource "aws_eip" "nat_instance_supplement" {
 }
 
 resource "aws_eip" "protected_nat_instance_supplement" {
-  count = local.lbt_enabled && var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
+  count = local.lbt_enabled && !local.reuse_supplement_eips && var.prevent_destroy_eips ? length(var.vpc_az_maps) : 0
 
   tags = merge(var.tags, {
     "Name" = "${var.nat_instance_eip_name_prefix}supplement-${count.index}"
@@ -163,8 +171,16 @@ resource "aws_autoscaling_group" "nat_instance" {
 
   lifecycle {
     precondition {
-      condition     = !(local.lbt_enabled && length(var.nat_instance_eip_ids) > 0)
-      error_message = "enable_launch_before_terminating is incompatible with nat_instance_eip_ids; the module manages its own per-AZ EIP pool."
+      condition     = !(local.lbt_enabled && length(var.nat_instance_eip_ids) > 0 && length(var.nat_instance_eip_ids) != length(var.vpc_az_maps))
+      error_message = "When enable_launch_before_terminating is combined with nat_instance_eip_ids, provide exactly one EIP per AZ (aligned with vpc_az_maps). These become pool member 0 (e.g. preserved NAT gateway EIPs); a supplemental EIP is added as member 1."
+    }
+    precondition {
+      condition     = length(var.nat_instance_eip_ids) == length(distinct(var.nat_instance_eip_ids))
+      error_message = "nat_instance_eip_ids must be unique. Duplicate allocation IDs would map the same member 0 EIP to multiple AZs, breaking the one-EIP-per-AZ pool and causing EIP association contention."
+    }
+    precondition {
+      condition     = length(var.nat_instance_supplement_eip_ids) == length(distinct(var.nat_instance_supplement_eip_ids))
+      error_message = "nat_instance_supplement_eip_ids must be unique. Duplicate allocation IDs would map the same member 1 EIP to multiple AZs, breaking the one-EIP-per-AZ pool and causing EIP association contention."
     }
   }
 
