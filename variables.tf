@@ -383,7 +383,7 @@ variable "wait_for_capacity_timeout" {
 }
 
 variable "enable_launch_before_terminating" {
-  description = "Launch a replacement NAT instance before terminating the old one (ASG instance maintenance policy 100/200). Provisions 2 EIPs per AZ so the replacement always has a free EIP to claim; the AZ alternates between its two EIPs each rotation. Both EIPs are created up front so they can be added to allow-lists in advance. Not compatible with nat_instance_eip_ids."
+  description = "Launch a replacement NAT instance before terminating the old one (ASG instance maintenance policy 100/200). Uses a pool of 2 EIPs per AZ so the replacement always has a free EIP to claim; the AZ alternates between its two EIPs each rotation. Pool member 0 is either module-created or, when nat_instance_eip_ids is provided (one per AZ), the supplied EIP (e.g. a preserved NAT gateway EIP). Pool member 1 (the supplement) is module-created unless nat_instance_supplement_eip_ids is provided. Both EIPs exist up front so they can be added to allow-lists in advance."
   type        = bool
   default     = false
 }

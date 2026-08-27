@@ -174,6 +174,14 @@ resource "aws_autoscaling_group" "nat_instance" {
       condition     = !(local.lbt_enabled && length(var.nat_instance_eip_ids) > 0 && length(var.nat_instance_eip_ids) != length(var.vpc_az_maps))
       error_message = "When enable_launch_before_terminating is combined with nat_instance_eip_ids, provide exactly one EIP per AZ (aligned with vpc_az_maps). These become pool member 0 (e.g. preserved NAT gateway EIPs); a supplemental EIP is added as member 1."
     }
+    precondition {
+      condition     = length(var.nat_instance_eip_ids) == length(distinct(var.nat_instance_eip_ids))
+      error_message = "nat_instance_eip_ids must be unique. Duplicate allocation IDs would map the same member 0 EIP to multiple AZs, breaking the one-EIP-per-AZ pool and causing EIP association contention."
+    }
+    precondition {
+      condition     = length(var.nat_instance_supplement_eip_ids) == length(distinct(var.nat_instance_supplement_eip_ids))
+      error_message = "nat_instance_supplement_eip_ids must be unique. Duplicate allocation IDs would map the same member 1 EIP to multiple AZs, breaking the one-EIP-per-AZ pool and causing EIP association contention."
+    }
   }
 
   dynamic "tag" {
