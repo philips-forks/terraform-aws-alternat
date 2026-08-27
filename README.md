@@ -101,7 +101,7 @@ Note that the route recovery feature does _not_ attempt to remediate any configu
 
 Recovery is opportunistic: any tester invocation that finds a healthy NAT instance while the route is on the NAT Gateway will restore it. If a consumer runs its own failback mechanism that deliberately pins an AZ to the NAT Gateway (for example, an operator- or alarm-triggered Lambda), a tester invocation that was already in flight when the failback started will happily undo it.
 
-Set `failback_parameter_name_prefix` to close this. The tester then reads the SSM parameter `<prefix>/<az>` before every restore decision, and again immediately before writing the route (the SSM connectivity round trip is long enough for a failback to begin part-way through). A value of `true` suppresses the restore for that AZ.
+Set `failback_parameter_name_prefix` to an absolute parameter path (for example `/alternat/staging/failback`) to close this. The tester then reads the SSM parameter `<prefix>/<az>` before every restore decision, and again before each individual route write — the SSM connectivity round trip, and the route writes themselves, are long enough for a failback to begin part-way through. A value of `true` suppresses the restore for that AZ.
 
 The consumer owns those parameters: create one per AZ, set it to `true` when failing back and `false` when handing control back to the tester. The check is deliberately fail-closed — if the parameter cannot be read, the tester skips the restore, because wrongly restoring silently undoes a deliberate failback while wrongly skipping only leaves traffic on the NAT Gateway. A parameter that does not exist yet is treated as `false`.
 
