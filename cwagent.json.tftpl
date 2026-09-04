@@ -9,6 +9,40 @@ if [ ! -d $CWAGENT_CONFIG_DIR ] || [ ! -w $CWAGENT_CONFIG_DIR ]; then
     exit 1
 fi
 
+# Resolve which network interfaces the agent should watch. The primary
+# (default-route) interface is always included so net/ethtool metrics keep
+# working across instance families that enumerate NICs differently (e.g. ens5
+# on older families, ens34 on newer ones). Any configured interfaces are added
+# only if they actually exist on this host.
+CONFIGURED_INTERFACES=$(echo '${cloudwatch_interfaces}' | tr -d '[]"' | tr ',' ' ')
+PRIMARY_INTERFACE=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')
+
+CW_SEEN=""
+CW_INTERFACES_JSON=""
+add_cw_iface() {
+    case " $CW_SEEN " in
+        *" $1 "*) return 0 ;;
+    esac
+    CW_SEEN="$CW_SEEN $1"
+    if [ -n "$CW_INTERFACES_JSON" ]; then
+        CW_INTERFACES_JSON="$CW_INTERFACES_JSON,"
+    fi
+    CW_INTERFACES_JSON="$CW_INTERFACES_JSON\"$1\""
+}
+if [ -n "$PRIMARY_INTERFACE" ]; then
+    add_cw_iface "$PRIMARY_INTERFACE"
+fi
+for iface in $CONFIGURED_INTERFACES; do
+    if [ -n "$iface" ] && ip link show dev "$iface" > /dev/null 2>&1; then
+        add_cw_iface "$iface"
+    fi
+done
+# Fall back to the configured list if nothing was detected (e.g. no default route yet).
+if [ -z "$CW_INTERFACES_JSON" ]; then
+    CW_INTERFACES_JSON=$(echo '${cloudwatch_interfaces}' | tr -d '[] ')
+fi
+CW_INTERFACES_JSON="[$CW_INTERFACES_JSON]"
+
 # Configuration that aims to report most metrics as provided for managed NAT Gateways.
 #
 # Adapted from the fck-nat project. All credit goes to its original contributors.
@@ -53,7 +87,7 @@ cat <<EOF > $CWAGENT_CONFIG_FILE
         }
       },
       "net": {
-        "resources": ${cloudwatch_interfaces},
+        "resources": $CW_INTERFACES_JSON,
         "measurement": [
           { "name": "bytes_recv", "rename": "BytesIn",  "unit": "Bytes" },
           { "name": "bytes_sent", "rename": "BytesOut",  "unit": "Bytes" },
@@ -79,7 +113,7 @@ cat <<EOF > $CWAGENT_CONFIG_FILE
         }
       },
       "ethtool": {
-        "interface_include": ${cloudwatch_interfaces},
+        "interface_include": $CW_INTERFACES_JSON,
         "metrics_include": [
           "bw_in_allowance_exceeded",
           "bw_out_allowance_exceeded",

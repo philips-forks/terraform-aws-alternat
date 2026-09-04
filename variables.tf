@@ -385,7 +385,7 @@ variable "cloudwatch_namespace" {
 }
 
 variable "cloudwatch_interfaces" {
-  description = "List of NAT instance interfaces that should be monitored by the CloudWatch Agent"
+  description = "Additional NAT instance interfaces to monitor with the CloudWatch Agent. The primary (default-route) interface is always monitored automatically; entries here are added only if they exist on the host."
   type        = list(string)
   default     = ["ens5", "ens6"]
 }
