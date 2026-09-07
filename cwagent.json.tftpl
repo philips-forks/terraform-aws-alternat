@@ -56,6 +56,18 @@ if ! command -v ethtool > /dev/null 2>&1; then
     fi
 fi
 
+# bpftrace powers the packet-drop classifier publisher below. Best-effort
+# install; the publisher stays idle if bpftrace is unavailable.
+if ! command -v bpftrace > /dev/null 2>&1; then
+    if command -v dnf > /dev/null 2>&1; then
+        dnf install -y bpftrace || true
+    elif command -v yum > /dev/null 2>&1; then
+        yum install -y bpftrace || true
+    elif command -v apt-get > /dev/null 2>&1; then
+        apt-get install -y bpftrace || true
+    fi
+fi
+
 # Configuration that aims to report most metrics as provided for managed NAT Gateways.
 #
 # Adapted from the fck-nat project. All credit goes to its original contributors.
@@ -249,3 +261,74 @@ PUBLISH_ETHTOOL_TIMER
 
 systemctl daemon-reload
 systemctl enable --now alternat-publish-ethtool.timer
+
+# Netdev drop counters (PacketsDropInCount) are a single scalar with no per-packet
+# destination, so they cannot distinguish forwarded-traffic loss from benign
+# host-local drops (e.g. the node's own SSM/CloudWatch-agent HTTPS connections
+# being torn down, which land as NO_SOCKET / TCP_ABORT_ON_DATA to this node's own
+# IP). This resident eBPF publisher classifies genuine drops (skb:kfree_skb with
+# reason > 2; reason 2 NOT_SPECIFIED is the benign GRO free path) by whether the
+# destination is this node's own IP, and emits two metrics so alerting can target
+# real forwarded-traffic loss (ForwardedPacketDropCount) and ignore host-local
+# noise (HostLocalPacketDropCount). No-ops if bpftrace is unavailable.
+cat <<'PUBLISH_DROPS_SCRIPT' > /usr/local/bin/alternat-publish-drops.sh
+#!/usr/bin/env bash
+set -uo pipefail
+command -v bpftrace > /dev/null 2>&1 || exec sleep infinity
+IFACE=$(ip -o -4 route show to default | awk '{print $5; exit}')
+[ -z "$IFACE" ] && exec sleep infinity
+LOCAL_IP=$(ip -o -4 addr show dev "$IFACE" | awk '{print $4}' | cut -d/ -f1 | head -1)
+[ -z "$LOCAL_IP" ] && exec sleep infinity
+# bpftrace reads iph->daddr as a little-endian u32: a.b.c.d -> a|(b<<8)|(c<<16)|(d<<24)
+IFS=. read -r o1 o2 o3 o4 <<< "$LOCAL_IP"
+LOCAL_LE=$(( o1 | (o2 << 8) | (o3 << 16) | (o4 << 24) ))
+TOKEN=$(curl -sSf --retry 3 --retry-delay 1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+IID=$(curl -sSf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+REGION=$(curl -sSf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+AZ=$(curl -sSf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+ASG=$(aws ec2 describe-tags --region "$REGION" --filters "Name=resource-id,Values=$IID" "Name=key,Values=aws:autoscaling:groupName" --query 'Tags[0].Value' --output text 2>/dev/null || true)
+DIMS="InstanceId=$IID,AvailabilityZone=$AZ,interface=$IFACE"
+if [ -n "$ASG" ] && [ "$ASG" != "None" ]; then
+  DIMS="$DIMS,AutoScalingGroupName=$ASG"
+fi
+
+cat > /run/alternat-drops.bt <<'BT'
+BEGIN { @fwd = 0; @local = 0; }
+tracepoint:skb:kfree_skb / args->reason > 2 /
+{
+  $skb = (struct sk_buff *)args->skbaddr;
+  $nh = $skb->network_header;
+  if ($nh == 0) { return; }
+  $iph = (struct iphdr *)($skb->head + $nh);
+  if ($iph->daddr == (uint32)$1) { @local = @local + 1; } else { @fwd = @fwd + 1; }
+}
+interval:s:60 { printf("DROPMETRIC %d %d\n", @fwd, @local); @fwd = 0; @local = 0; }
+BT
+
+stdbuf -oL bpftrace /run/alternat-drops.bt "$LOCAL_LE" 2>/dev/null | while read -r tag fwd hostlocal; do
+  [ "$tag" = "DROPMETRIC" ] || continue
+  case "$fwd$hostlocal" in *[!0-9]*) continue ;; esac
+  aws cloudwatch put-metric-data --region "$REGION" --namespace "${cloudwatch_namespace}" --metric-name ForwardedPacketDropCount --unit Count --value "$fwd" --dimensions "$DIMS"
+  aws cloudwatch put-metric-data --region "$REGION" --namespace "${cloudwatch_namespace}" --metric-name HostLocalPacketDropCount --unit Count --value "$hostlocal" --dimensions "$DIMS"
+done
+PUBLISH_DROPS_SCRIPT
+chmod 0755 /usr/local/bin/alternat-publish-drops.sh
+
+cat <<'PUBLISH_DROPS_SERVICE' > /etc/systemd/system/alternat-publish-drops.service
+[Unit]
+Description=Publish alterNAT packet-drop classification to CloudWatch
+After=network-online.target amazon-cloudwatch-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/alternat-publish-drops.sh
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+PUBLISH_DROPS_SERVICE
+
+systemctl daemon-reload
+systemctl enable --now alternat-publish-drops.service
