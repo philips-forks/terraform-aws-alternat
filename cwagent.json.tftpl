@@ -292,8 +292,8 @@ systemctl enable --now alternat-publish-ethtool.timer
 # destination is this node's own IP, and emits two metrics so alerting can target
 # real forwarded-traffic loss (ForwardedPacketDropCount) and ignore host-local
 # noise (HostLocalPacketDropCount). Each forwarded drop is additionally recorded
-# (reason code + protocol + src/dst ip:port, plus the pre-SNAT/original client
-# IP from conntrack when available) as a JSON line in
+# (drop reason code + name, protocol + src/dst ip:port, plus the pre-SNAT/original
+# client IP from conntrack when available) as a JSON line in
 # /var/log/alternat-packet-drops.log, which the CloudWatch agent ships to the
 # "${cloudwatch_namespace}/packet-drops" log group for post-hoc investigation.
 # Per-minute log volume is capped to avoid flooding during a drop storm; the
@@ -317,6 +317,19 @@ ASG=$(aws ec2 describe-tags --region "$REGION" --filters "Name=resource-id,Value
 DIMS="InstanceId=$IID,AvailabilityZone=$AZ,interface=$IFACE"
 if [ -n "$ASG" ] && [ "$ASG" != "None" ]; then
   DIMS="$DIMS,AutoScalingGroupName=$ASG"
+fi
+
+# Build the skb_drop_reason number->name map from this kernel's own tracepoint
+# format file into a lookup file (avoid bash associative arrays and brace
+# expansion so the terraform templatefile does not treat them as interpolations).
+# The enum values are kernel-version-specific, so resolving them from the
+# running kernel keeps reason_name correct across AMI/kernel bumps.
+REASON_MAP=/run/alternat-reason-names
+: > "$REASON_MAP"
+FMT=/sys/kernel/tracing/events/skb/kfree_skb/format
+[ -r "$FMT" ] || FMT=/sys/kernel/debug/tracing/events/skb/kfree_skb/format
+if [ -r "$FMT" ]; then
+  grep -oE '\{ *[0-9]+, *"[A-Z0-9_]+" *\}' "$FMT" | sed -E 's/[{}"]//g; s/,/ /' | awk '{print $1, $2}' > "$REASON_MAP"
 fi
 
 cat > /run/alternat-drops.bt <<'BT'
@@ -380,9 +393,11 @@ stdbuf -oL bpftrace /run/alternat-drops.bt "$LOCAL_LE" 2>/dev/null | while read 
       if [ "$logged" -lt "$LOG_CAP_PER_MIN" ]; then
         pname="$f2"
         case "$f2" in 6) pname=tcp ;; 17) pname=udp ;; 1) pname=icmp ;; esac
+        rname=$(awk -v k="$f1" '$1==k{print $2; f=1} END{if(!f) print "UNKNOWN_" k}' "$REASON_MAP" 2>/dev/null)
+        [ -z "$rname" ] && rname="UNKNOWN_$f1"
         origsrc="$f7"
         case "$origsrc" in ""|0.0.0.0) origsrc="unknown" ;; esac
-        printf '{"ts":"%s","reason":%s,"proto":"%s","src":"%s:%s","dst":"%s:%s","orig_src":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$f1" "$pname" "$f3" "$f4" "$f5" "$f6" "$origsrc" >> "$DROP_LOG"
+        printf '{"ts":"%s","reason":%s,"reason_name":"%s","proto":"%s","src":"%s:%s","dst":"%s:%s","orig_src":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$f1" "$rname" "$pname" "$f3" "$f4" "$f5" "$f6" "$origsrc" >> "$DROP_LOG"
         logged=$((logged + 1))
       else
         suppressed=$((suppressed + 1))
