@@ -312,8 +312,10 @@ resource "aws_launch_template" "nat_instance_template" {
   image_id = local.nat_instance_image_id
 
   # Conditional block device mapping for AL2023 Minimal AMI.
-  # By default the root volume is only 2GB and not enough free space
-  # to safely install and use the CloudWatch Agent.
+  # The AL2023 Minimal root volume is only ~2GB, which leaves too little free
+  # space for the CloudWatch Agent (and on-node diagnostics). The size is
+  # configurable via nat_instance_root_volume_size; the AL2023 root filesystem
+  # auto-grows to it at boot.
   dynamic "block_device_mappings" {
     for_each = (try(strcontains(local.nat_instance_image_id, "al2023-ami-minimal"), false) && var.enable_cloudwatch_agent) ? [1] : []
 
@@ -321,7 +323,7 @@ resource "aws_launch_template" "nat_instance_template" {
       device_name = "/dev/xvda"
 
       ebs {
-        volume_size = 3
+        volume_size = var.nat_instance_root_volume_size
         volume_type = "gp3"
         encrypted   = true
       }

@@ -198,6 +198,11 @@ module "alternat_instances" {
     }
   }
 
+  # Root volume size (GiB) for the AL2023 Minimal AMI when the CloudWatch Agent
+  # is enabled. The AL2023 root filesystem auto-grows to this size at boot, so
+  # no AMI rebuild is needed. Defaults to 3.
+  nat_instance_root_volume_size = 5
+
   tags = var.tags
 
   vpc_id      = module.vpc.vpc_id

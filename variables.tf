@@ -145,6 +145,12 @@ variable "nat_instance_block_devices" {
   default     = {}
 }
 
+variable "nat_instance_root_volume_size" {
+  description = "Root EBS volume size (GiB) for the NAT instance on the AL2023 Minimal AMI with the CloudWatch Agent enabled. The AL2023 root filesystem auto-grows to this size at boot, so no AMI rebuild is required to change it."
+  type        = number
+  default     = 3
+}
+
 variable "nat_instance_iam_profile_name" {
   description = "Name to use for the IAM profile used by the NAT instance. Must be globally unique in this AWS account. Defaults to alternat-instance- as a prefix."
   type        = string
