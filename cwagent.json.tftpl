@@ -150,9 +150,30 @@ cat <<EOF > $CWAGENT_CONFIG_FILE
       "InstanceId": "\$${aws:InstanceId}",
       "AutoScalingGroupName": "\$${aws:AutoScalingGroupName}"
     }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/alternat-packet-drops.log",
+            "log_group_name": "${cloudwatch_namespace}/packet-drops",
+            "log_stream_name": "{instance_id}",
+            "timezone": "UTC",
+            "timestamp_format": "%Y-%m-%dT%H:%M:%SZ",
+            "retention_in_days": 14
+          }
+        ]
+      }
+    }
   }
 }
 EOF
+
+# Ensure the drop-detail log exists before the agent starts tailing it. The
+# resident eBPF publisher (below) appends per-drop JSON records here.
+touch /var/log/alternat-packet-drops.log
+chmod 0640 /var/log/alternat-packet-drops.log
 
 systemctl restart amazon-cloudwatch-agent
 
@@ -270,7 +291,13 @@ systemctl enable --now alternat-publish-ethtool.timer
 # reason > 2; reason 2 NOT_SPECIFIED is the benign GRO free path) by whether the
 # destination is this node's own IP, and emits two metrics so alerting can target
 # real forwarded-traffic loss (ForwardedPacketDropCount) and ignore host-local
-# noise (HostLocalPacketDropCount). No-ops if bpftrace is unavailable.
+# noise (HostLocalPacketDropCount). Each forwarded drop is additionally recorded
+# (drop reason code + name, protocol + src/dst ip:port, plus the pre-SNAT/original
+# client IP from conntrack when available) as a JSON line in
+# /var/log/alternat-packet-drops.log, which the CloudWatch agent ships to the
+# "${cloudwatch_namespace}/packet-drops" log group for post-hoc investigation.
+# Per-minute log volume is capped to avoid flooding during a drop storm; the
+# count metrics remain authoritative. No-ops if bpftrace is unavailable.
 cat <<'PUBLISH_DROPS_SCRIPT' > /usr/local/bin/alternat-publish-drops.sh
 #!/usr/bin/env bash
 set -uo pipefail
@@ -292,6 +319,19 @@ if [ -n "$ASG" ] && [ "$ASG" != "None" ]; then
   DIMS="$DIMS,AutoScalingGroupName=$ASG"
 fi
 
+# Build the skb_drop_reason number->name map from this kernel's own tracepoint
+# format file into a lookup file (avoid bash associative arrays and brace
+# expansion so the terraform templatefile does not treat them as interpolations).
+# The enum values are kernel-version-specific, so resolving them from the
+# running kernel keeps reason_name correct across AMI/kernel bumps.
+REASON_MAP=/run/alternat-reason-names
+: > "$REASON_MAP"
+FMT=/sys/kernel/tracing/events/skb/kfree_skb/format
+[ -r "$FMT" ] || FMT=/sys/kernel/debug/tracing/events/skb/kfree_skb/format
+if [ -r "$FMT" ]; then
+  grep -oE '\{ *[0-9]+, *"[A-Z0-9_]+" *\}' "$FMT" | sed -E 's/[{}"]//g; s/,/ /' | awk '{print $1, $2}' > "$REASON_MAP"
+fi
+
 cat > /run/alternat-drops.bt <<'BT'
 BEGIN { @fwd = 0; @local = 0; }
 tracepoint:skb:kfree_skb / args->reason > 2 /
@@ -300,19 +340,86 @@ tracepoint:skb:kfree_skb / args->reason > 2 /
   $nh = $skb->network_header;
   if ($nh == 0) { return; }
   $iph = (struct iphdr *)($skb->head + $nh);
-  if ($iph->daddr == (uint32)$1) { @local = @local + 1; } else { @fwd = @fwd + 1; }
+  $daddr = $iph->daddr;
+  if ($daddr == (uint32)$1) { @local = @local + 1; return; }
+  @fwd = @fwd + 1;
+  $saddr = $iph->saddr;
+  $proto = $iph->protocol;
+  $ihl = (*(uint8 *)$iph) & 0x0f;
+  $th = $skb->head + $nh + ($ihl << 2);
+  $sport = 0;
+  $dport = 0;
+  if ($proto == 6 || $proto == 17) {
+    $sp = *(uint16 *)($th);
+    $dp = *(uint16 *)($th + 2);
+    $sport = (($sp & 0xff) << 8) | (($sp >> 8) & 0xff);
+    $dport = (($dp & 0xff) << 8) | (($dp >> 8) & 0xff);
+  }
+  // Pre-SNAT source from the skb conntrack entry (skb->_nfct, low 3 bits are
+  // ctinfo). For a masqueraded flow the ORIGINAL-direction tuple source is the
+  // real client (runner) IP; 0.0.0.0 when no ct is attached.
+  $orig = (uint32)0;
+  $nfct = $skb->_nfct;
+  if ($nfct != 0) {
+    $ct = (struct nf_conn *)($nfct & ~7);
+    $orig = $ct->tuplehash[0].tuple.src.u3.ip;
+  }
+  printf("DROPINFO %d %d %d.%d.%d.%d %d %d.%d.%d.%d %d %d.%d.%d.%d\n",
+    args->reason, $proto,
+    $saddr & 0xff, ($saddr >> 8) & 0xff, ($saddr >> 16) & 0xff, ($saddr >> 24) & 0xff, $sport,
+    $daddr & 0xff, ($daddr >> 8) & 0xff, ($daddr >> 16) & 0xff, ($daddr >> 24) & 0xff, $dport,
+    $orig & 0xff, ($orig >> 8) & 0xff, ($orig >> 16) & 0xff, ($orig >> 24) & 0xff);
 }
 interval:s:60 { printf("DROPMETRIC %d %d\n", @fwd, @local); @fwd = 0; @local = 0; }
 BT
 
-stdbuf -oL bpftrace /run/alternat-drops.bt "$LOCAL_LE" 2>/dev/null | while read -r tag fwd hostlocal; do
-  [ "$tag" = "DROPMETRIC" ] || continue
-  case "$fwd$hostlocal" in *[!0-9]*) continue ;; esac
-  aws cloudwatch put-metric-data --region "$REGION" --namespace "${cloudwatch_namespace}" --metric-name ForwardedPacketDropCount --unit Count --value "$fwd" --dimensions "$DIMS"
-  aws cloudwatch put-metric-data --region "$REGION" --namespace "${cloudwatch_namespace}" --metric-name HostLocalPacketDropCount --unit Count --value "$hostlocal" --dimensions "$DIMS"
+DROP_LOG="/var/log/alternat-packet-drops.log"
+LOG_CAP_PER_MIN=500
+logged=0
+suppressed=0
+stdbuf -oL bpftrace /run/alternat-drops.bt "$LOCAL_LE" 2>/dev/null | while read -r tag f1 f2 f3 f4 f5 f6 f7; do
+  case "$tag" in
+    DROPMETRIC)
+      case "$f1$f2" in *[!0-9]*) continue ;; esac
+      aws cloudwatch put-metric-data --region "$REGION" --namespace "${cloudwatch_namespace}" --metric-name ForwardedPacketDropCount --unit Count --value "$f1" --dimensions "$DIMS"
+      aws cloudwatch put-metric-data --region "$REGION" --namespace "${cloudwatch_namespace}" --metric-name HostLocalPacketDropCount --unit Count --value "$f2" --dimensions "$DIMS"
+      if [ "$suppressed" -gt 0 ]; then
+        printf '{"ts":"%s","event":"suppressed","dropped_lines":%d}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$suppressed" >> "$DROP_LOG"
+      fi
+      logged=0
+      suppressed=0
+      ;;
+    DROPINFO)
+      if [ "$logged" -lt "$LOG_CAP_PER_MIN" ]; then
+        pname="$f2"
+        case "$f2" in 6) pname=tcp ;; 17) pname=udp ;; 1) pname=icmp ;; esac
+        rname=$(awk -v k="$f1" '$1==k{print $2; f=1} END{if(!f) print "UNKNOWN_" k}' "$REASON_MAP" 2>/dev/null)
+        [ -z "$rname" ] && rname="UNKNOWN_$f1"
+        origsrc="$f7"
+        case "$origsrc" in ""|0.0.0.0) origsrc="unknown" ;; esac
+        printf '{"ts":"%s","reason":%s,"reason_name":"%s","proto":"%s","src":"%s:%s","dst":"%s:%s","orig_src":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$f1" "$rname" "$pname" "$f3" "$f4" "$f5" "$f6" "$origsrc" >> "$DROP_LOG"
+        logged=$((logged + 1))
+      else
+        suppressed=$((suppressed + 1))
+      fi
+      ;;
+  esac
 done
 PUBLISH_DROPS_SCRIPT
 chmod 0755 /usr/local/bin/alternat-publish-drops.sh
+
+cat <<'DROPS_LOGROTATE' > /etc/logrotate.d/alternat-packet-drops
+/var/log/alternat-packet-drops.log {
+  daily
+  rotate 7
+  maxsize 20M
+  missingok
+  notifempty
+  copytruncate
+  compress
+  delaycompress
+}
+DROPS_LOGROTATE
 
 cat <<'PUBLISH_DROPS_SERVICE' > /etc/systemd/system/alternat-publish-drops.service
 [Unit]
